@@ -1,0 +1,35 @@
+[
+  {
+    "domain": "industrial-tools-br.com",
+    "canonical_url": "https://industrial-tools-br.com/p/dewalt-dcd777-20v",
+    "sku": "SKU-DEWALT-DCD777",
+    "product_title": "DeWalt 20V Max Brushless Compact Drill Driver Kit",
+    "currency_code": "BRL",
+    "current_price": "1149.9000",
+    "availability_status": "IN_STOCK",
+    "promo_badge": "BLACK_NOVEMBER_15_OFF",
+    "seller_name": "Industrial Tools Brasil Oficial"
+  },
+  {
+    "domain": "pro-machinery-supply.com",
+    "canonical_url": "https://pro-machinery-supply.com/catalog/bosch-gbh-2-24d",
+    "sku": "SKU-BOSCH-GBH224D",
+    "product_title": "Bosch Martelete Perfurador Rompedor GBH 2-24D 820W",
+    "currency_code": "BRL",
+    "current_price": "879.0000",
+    "availability_status": "IN_STOCK",
+    "promo_badge": "PIX_DISCOUNT_10",
+    "seller_name": "Pro Machinery Supply"
+  },
+  {
+    "domain": "global-parts-direct.com",
+    "canonical_url": "https://global-parts-direct.com/items/fluke-117-multimeter",
+    "sku": "SKU-FLUKE-117",
+    "product_title": "Fluke 117 Electricians True-RMS Multimeter",
+    "currency_code": "USD",
+    "current_price": "249.5000",
+    "availability_status": "OUT_OF_STOCK",
+    "promo_badge": null,
+    "seller_name": "Global Parts Direct LLC"
+  }
+]

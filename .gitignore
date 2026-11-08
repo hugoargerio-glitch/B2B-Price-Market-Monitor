@@ -1,27 +1,61 @@
-# Virtual Environments & Python
+# ==============================================================================
+# .gitignore — B2B Price & Market Monitor (Profile 1: Lean App / CDC Engine)
+# ==============================================================================
+
+# Virtual Environments & Python Artifacts
 .venv/
+venv/
+ENV/
 __pycache__/
 *.py[cod]
+*$py.class
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
 
-# Local Lakehouse Databases (DuckDB & SQLite)
-*.duckdb
-*.duckdb.wal
+# Local SQLite WAL & Lakehouse Databases
 *.db
 *.db-wal
 *.db-shm
 *.db-journal
+*.sqlite
+*.sqlite3
+*.duckdb
+*.duckdb.wal
+data/*.db*
 
-# dbt Artifacts & Logs (except canonical prod_manifest for state:modified+)
-dbt_project/target/
-dbt_project/logs/
-dbt_project/dbt_packages/
-
-# Environment Secrets
+# Environment Secrets & Credentials (NEVER COMMIT)
 .env
 .env.*
 !.env.example
 
+# Agentic Harness & AI IDE Configurations (Local Development Only)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.claude/
+.gemini/
+.agents/
+.cursor/
+.windsurf/
+skills/
+
+# Legacy Boilerplate OLAP Directories
+dbt_project/
+pipelines/
+target/
 .bruin.yml
-logs/runs
-logs/*.log
+logs/
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~

@@ -1,0 +1,30 @@
+# ==============================================================================
+# docker-compose.yml — B2B Price & Market Monitor
+# ==============================================================================
+services:
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: b2b-price-monitor:latest
+    container_name: b2b-price-monitor
+    environment:
+      - B2B_DB_PATH=/app/data/b2b_monitor.db
+      - B2B_WEBHOOK_URL=${B2B_WEBHOOK_URL:-}
+    volumes:
+      - sqlite_wal_data:/app/data
+      - ./examples:/app/examples:ro
+    command: ["run", "--items", "5"]
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: b2b-price-monitor:latest
+    container_name: b2b-price-monitor-test
+    profiles: ["test"]
+    entrypoint: ["pytest"]
+    command: ["-v"]
+
+volumes:
+  sqlite_wal_data:

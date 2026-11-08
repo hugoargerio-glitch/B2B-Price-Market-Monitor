@@ -1,0 +1,28 @@
+# ==============================================================================
+# .dockerignore — B2B Price & Market Monitor
+# ==============================================================================
+.git
+.gitignore
+.github
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+data/
+.env
+.env.*
+!.env.example
+AGENTS.md
+.claude
+.gemini
+.agents
+skills
+dbt_project
+pipelines
+target
+logs

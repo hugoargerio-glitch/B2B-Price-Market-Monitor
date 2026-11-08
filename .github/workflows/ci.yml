@@ -1,4 +1,4 @@
-name: Medallion OLAP & ODCS v3.2.0 Contract CI
+name: B2B Price Monitor — CDC Engine, ODCS v3.2.0 & Docker CI
 
 on:
   push:
@@ -7,8 +7,8 @@ on:
     branches: [main]
 
 jobs:
-  verify-lakehouse-and-contracts:
-    name: Bruin (Bronze) + dbt (Silver/Gold) + ODCS v3.2.0 Gate
+  verify-cdc-engine-and-contracts:
+    name: Pytest (65 Checks) + ODCS v3.2.0 Contract + Docker Gate
     runs-on: ubuntu-latest
 
     steps:
@@ -20,28 +20,24 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Install Bruin CLI
-        run: |
-          curl -LsSf https://getbruin.com/install/cli | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-
       - name: Sync Virtual Environment (.venv)
         run: uv sync --frozen
 
-      - name: Gate 1 — Validate & Execute Bronze Ingestion (Bruin)
-        run: |
-          bruin validate ./pipelines/
-          bruin run ./pipelines/
+      - name: Gate 1 — Lint Executable ODCS v3.2.0 Data Contract
+        run: uv run datacontract lint ./contracts/b2b_price_monitor_v1.odcs.yaml
 
-      - name: Gate 2 — Build & Test Silver/Gold Models (dbt Core + DuckDB)
-        run: |
-          uv run dbt build --project-dir ./dbt_project --profiles-dir ./dbt_project
+      - name: Gate 2 — Execute 65 Unit, Integration & SQL Invariant Tests
+        run: uv run pytest -v
 
-      - name: Gate 3 — Verify Selective State Compilation (state:modified+)
+      - name: Gate 3 — Verify End-to-End CLI Simulation, Outbox Dispatch & Housekeeping
         run: |
-          uv run dbt compile --project-dir ./dbt_project --profiles-dir ./dbt_project --select state:modified+ --state ./target/prod_manifest
+          uv run python -m src.main run --items 5 --dry-run
+          uv run python -m src.main ingest --file examples/sample_scrape_batch.json
+          uv run python -m src.main clean-outbox --days 30
+          uv run python -m src.main vacuum
 
-      - name: Gate 4 — Lint & Execute ODCS v3.2.0 Data Contract (62 Checks)
+      - name: Gate 4 — Build & Verify Multi-Stage Docker Container
         run: |
-          uv run datacontract lint ./contracts/orders_silver_v1.odcs.yaml
-          uv run datacontract test ./contracts/orders_silver_v1.odcs.yaml --server local_duckdb
+          docker build -t b2b-price-monitor:ci .
+          docker run --rm --entrypoint pytest b2b-price-monitor:ci -v
+          docker run --rm b2b-price-monitor:ci run --items 5 --dry-run

@@ -1,8 +1,0 @@
-de_agentic_lakehouse:
-  target: dev_duckdb
-  outputs:
-    dev_duckdb:
-      type: duckdb
-      path: /home/Hugo/b2b-price-monitor/local_lakehouse.duckdb
-      schema: silver_ecommerce
-      threads: 4
