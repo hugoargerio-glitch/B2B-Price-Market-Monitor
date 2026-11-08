@@ -4,8 +4,9 @@ Manages notification dispatch with strict state transitions:
   PENDING -> DISPATCHED | FAILED -> DEAD_LETTER
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import random
 import sqlite3
 from typing import Callable, Optional
 
@@ -13,14 +14,43 @@ from src.models import NotificationStatus, PriceChangeOutbox
 from src.storage import transaction
 
 
+def calculate_backoff_seconds(
+    retry_count: int,
+    base_seconds: float = 1.0,
+    max_seconds: float = 300.0,
+    with_jitter: bool = True,
+) -> float:
+    """Calculate Exponential Backoff with Full Jitter:
+    t_wait = min(t_max, t_base * 2^retry_count) + jitter
+    """
+    if retry_count <= 0:
+        return 0.0
+    exp_wait = min(max_seconds, base_seconds * (2 ** retry_count))
+    jitter = random.uniform(0.0, base_seconds) if with_jitter else 0.0
+    return min(max_seconds, exp_wait + jitter)
+
+
 class OutboxDispatcher:
     """Dispatches pending outbox events and transitions states under ACID transactions."""
 
-    def __init__(self, conn: sqlite3.Connection, max_retries: int = 5):
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        max_retries: int = 5,
+        base_backoff_seconds: float = 1.0,
+        max_backoff_seconds: float = 300.0,
+    ):
         self.conn = conn
         self.max_retries = max_retries
+        self.base_backoff_seconds = base_backoff_seconds
+        self.max_backoff_seconds = max_backoff_seconds
 
-    def fetch_pending_events(self, limit: int = 50) -> list[PriceChangeOutbox]:
+    def fetch_pending_events(
+        self,
+        limit: int = 50,
+        enforce_backoff: bool = False,
+        now_utc: Optional[datetime] = None,
+    ) -> list[PriceChangeOutbox]:
         """Fetch outbox records that require dispatch (PENDING or FAILED with retry_count < max_retries)."""
         cursor = self.conn.cursor()
         try:
@@ -38,7 +68,7 @@ class OutboxDispatcher:
                 (self.max_retries, limit),
             )
             rows = cursor.fetchall()
-            return [
+            events = [
                 PriceChangeOutbox(
                     outbox_id=row["outbox_id"],
                     entity_key=row["entity_key"],
@@ -52,6 +82,25 @@ class OutboxDispatcher:
                 )
                 for row in rows
             ]
+            if not enforce_backoff:
+                return events
+
+            ref_now = now_utc or datetime.now(timezone.utc)
+            ready_events: list[PriceChangeOutbox] = []
+            for ev in events:
+                if ev.notification_status == NotificationStatus.PENDING or ev.retry_count == 0:
+                    ready_events.append(ev)
+                else:
+                    wait_sec = calculate_backoff_seconds(
+                        ev.retry_count,
+                        base_seconds=self.base_backoff_seconds,
+                        max_seconds=self.max_backoff_seconds,
+                        with_jitter=False,
+                    )
+                    updated_dt = ev.updated_at if ev.updated_at.tzinfo else ev.updated_at.replace(tzinfo=timezone.utc)
+                    if ref_now >= updated_dt + timedelta(seconds=wait_sec):
+                        ready_events.append(ev)
+            return ready_events
         finally:
             cursor.close()
 

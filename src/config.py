@@ -32,5 +32,7 @@ class DatabaseConfig:
 @dataclass(frozen=True)
 class CircuitBreakerConfig:
     max_quarantine_rate: float = 0.20  # 20% template drift threshold
+    min_sample_size: int = 10  # Minimum domain sample floor before tripping percentage breaker
     max_retries: int = 5
     backoff_base_seconds: float = 1.0
+    backoff_max_seconds: float = 300.0

@@ -7,7 +7,7 @@ DATACONTRACT := $(UV) run --offline datacontract
 DBT_FLAGS := --project-dir ./dbt_project --profiles-dir ./dbt_project
 PYTHON := $(UV) run python
 
-.PHONY: help setup ingest compile build build-modified init-state contract-lint contract-test validate all simulate dispatch status run
+.PHONY: help setup ingest compile build build-modified init-state contract-lint contract-test validate all simulate dispatch status clean-outbox vacuum run
 
 help:
 	@echo "======================================================================"
@@ -18,6 +18,8 @@ help:
 	@echo "  make ingest         -> Run Bruin ingestion or ingest JSON (make ingest FILE=sample.json)"
 	@echo "  make dispatch       -> Dispatch pending outbox notifications"
 	@echo "  make status         -> Display executive terminal status dashboard"
+	@echo "  make clean-outbox   -> Purge DISPATCHED outbox records (>30 days retention)"
+	@echo "  make vacuum         -> Truncate SQLite WAL journal and VACUUM free pages"
 	@echo "  make run            -> Complete flow: simulate -> dispatch -> status"
 	@echo "  make build          -> Build & test Silver/Gold models in dbt Core"
 	@echo "  make init-state     -> Save baseline manifest.json to ./target/prod_manifest"
@@ -38,6 +40,12 @@ dispatch:
 
 status:
 	$(PYTHON) -m src.main status
+
+clean-outbox:
+	$(PYTHON) -m src.main clean-outbox
+
+vacuum:
+	$(PYTHON) -m src.main vacuum
 
 run:
 	$(PYTHON) -m src.main run

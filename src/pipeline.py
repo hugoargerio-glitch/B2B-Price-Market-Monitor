@@ -427,13 +427,19 @@ class PriceMonitorPipeline:
         tripped_domains: set[str] = set()
         for dom, total in domain_counts.items():
             fail_count = domain_failures.get(dom, 0)
-            if total > 0 and (fail_count / total) > self.cb_config.max_quarantine_rate:
+            if (
+                total >= self.cb_config.min_sample_size
+                and (fail_count / total) > self.cb_config.max_quarantine_rate
+            ):
                 tripped_domains.add(dom)
                 logger.warning(
-                    "CIRCUIT_BREAKER_TRIPPED: Domain %s failure rate %.2f exceeds %.2f threshold. "
+                    "CIRCUIT_BREAKER_TRIPPED: Domain %s failure rate %.2f (%d/%d, min_sample=%d) exceeds %.2f threshold. "
                     "Halt customer-facing notifications (TEMPLATE_DRIFT_DETECTED).",
                     dom,
                     fail_count / total,
+                    fail_count,
+                    total,
+                    self.cb_config.min_sample_size,
                     self.cb_config.max_quarantine_rate,
                 )
 

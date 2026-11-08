@@ -22,7 +22,12 @@ from src.notifications import WebhookNotifier
 from src.outbox import OutboxDispatcher
 from src.pipeline import PriceMonitorPipeline
 from src.scraper import MarketSimulator
-from src.storage import get_connection, init_db
+from src.storage import (
+    checkpoint_and_vacuum,
+    get_connection,
+    init_db,
+    purge_dispatched_outbox,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -201,6 +206,33 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clean_outbox(args: argparse.Namespace) -> int:
+    """Purge DISPATCHED outbox records older than retention days."""
+    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
+    retention_days = getattr(args, "days", 30)
+
+    conn = get_connection(db_path)
+    init_db(conn)
+    deleted = purge_dispatched_outbox(conn, retention_days=retention_days)
+    conn.close()
+
+    print(f"🧹 Housekeeping: Purged {deleted} DISPATCHED outbox record(s) older than {retention_days} days.")
+    return 0
+
+
+def cmd_vacuum(args: argparse.Namespace) -> int:
+    """Truncate WAL journal and vacuum SQLite database pages."""
+    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
+
+    conn = get_connection(db_path)
+    init_db(conn)
+    checkpoint_and_vacuum(conn)
+    conn.close()
+
+    print(f"🧹 Housekeeping: Executed PRAGMA wal_checkpoint(TRUNCATE) and VACUUM on '{db_path}'.")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Execute complete end-to-end flow: simulate -> dispatch -> status."""
     print("==============================================================================")
@@ -259,6 +291,13 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     subparsers.add_parser("status", help="Display executive status dashboard")
 
+    # clean-outbox
+    sub_clean = subparsers.add_parser("clean-outbox", help="Purge DISPATCHED outbox records older than N days")
+    sub_clean.add_argument("--days", "-d", type=int, default=30, help="Retention window in days (default: 30)")
+
+    # vacuum
+    subparsers.add_parser("vacuum", help="Execute WAL checkpoint(TRUNCATE) and VACUUM on SQLite DB")
+
     # run
     sub_run = subparsers.add_parser("run", help="Run end-to-end simulate -> dispatch -> status")
     sub_run.add_argument("--items", "-n", type=int, default=5, help="Number of items to simulate")
@@ -292,6 +331,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "ingest": cmd_ingest,
         "dispatch": cmd_dispatch,
         "status": cmd_status,
+        "clean-outbox": cmd_clean_outbox,
+        "vacuum": cmd_vacuum,
         "run": cmd_run,
     }
 

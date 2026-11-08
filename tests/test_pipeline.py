@@ -186,13 +186,13 @@ def test_pipeline_shift_left_quarantine_without_batch_abortion(pipeline_db):
 
 
 def test_pipeline_domain_circuit_breaker(pipeline_db):
-    """When a domain has >20% failure rate in a batch, circuit breaker trips and halts alerts."""
+    """When a domain has >= min_sample_size items and >20% failure rate, circuit breaker trips and halts alerts."""
     pipeline = PriceMonitorPipeline(
         pipeline_db,
-        circuit_breaker_config=CircuitBreakerConfig(max_quarantine_rate=0.20),
+        circuit_breaker_config=CircuitBreakerConfig(max_quarantine_rate=0.20, min_sample_size=10),
     )
 
-    # Batch with 5 items for bad-domain.com: 2 valid, 3 invalid (60% failure rate)
+    # Batch with 10 items for bad-domain.com: 4 valid, 6 invalid (60% failure rate, total=10 >= 10)
     batch = [
         {
             "domain": "bad-domain.com",
@@ -200,19 +200,53 @@ def test_pipeline_domain_circuit_breaker(pipeline_db):
             "sku": f"SKU-{i}",
             "product_title": f"Product {i}",
             "currency_code": "BRL",
-            "current_price": Decimal("100.0000") if i < 2 else 99.99,  # Float for i >= 2
+            "current_price": Decimal("100.0000") if i < 4 else 99.99,  # Float for i >= 4
             "availability_status": AvailabilityStatus.IN_STOCK.value,
         }
-        for i in range(5)
+        for i in range(10)
     ]
 
     summary = pipeline.ingest_batch(batch)
     assert "bad-domain.com" in summary.tripped_circuit_breakers
-    assert summary.quarantined == 3
-    assert summary.inserted_new == 2
+    assert summary.quarantined == 6
+    assert summary.inserted_new == 4
 
     cur = pipeline_db.cursor()
     cur.execute("SELECT notification_status, last_notification_error FROM price_change_outbox WHERE entity_key IN (SELECT entity_key FROM product_price_state WHERE domain = 'bad-domain.com');")
     for notif_stat, notif_err in cur.fetchall():
         assert notif_stat == NotificationStatus.FAILED.value
         assert notif_err == "HALTED_BY_CIRCUIT_BREAKER"
+
+
+def test_pipeline_circuit_breaker_ignores_small_sample_size(pipeline_db):
+    """When a domain has < min_sample_size items (e.g., 3 items with 1 failure = 33%), circuit breaker MUST NOT trip."""
+    pipeline = PriceMonitorPipeline(
+        pipeline_db,
+        circuit_breaker_config=CircuitBreakerConfig(max_quarantine_rate=0.20, min_sample_size=10),
+    )
+
+    # 3 items: 2 valid, 1 invalid (33.3% > 20%, but total=3 < min_sample_size=10)
+    batch = [
+        {
+            "domain": "boutique-domain.com",
+            "canonical_url": f"https://boutique-domain.com/p{i}",
+            "sku": f"BOUTIQUE-{i}",
+            "product_title": f"Boutique Product {i}",
+            "currency_code": "BRL",
+            "current_price": Decimal("150.0000") if i < 2 else 149.99,
+            "availability_status": AvailabilityStatus.IN_STOCK.value,
+        }
+        for i in range(3)
+    ]
+
+    summary = pipeline.ingest_batch(batch)
+    assert "boutique-domain.com" not in summary.tripped_circuit_breakers
+    assert summary.quarantined == 1
+    assert summary.inserted_new == 2
+
+    cur = pipeline_db.cursor()
+    cur.execute(
+        "SELECT notification_status FROM price_change_outbox WHERE entity_key IN (SELECT entity_key FROM product_price_state WHERE domain = 'boutique-domain.com');"
+    )
+    for (notif_stat,) in cur.fetchall():
+        assert notif_stat == NotificationStatus.PENDING.value

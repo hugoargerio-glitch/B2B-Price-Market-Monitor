@@ -119,3 +119,16 @@ def test_cli_run_end_to_end(cli_db_path, capsys):
     assert "SIMULATION INGESTION SUMMARY" in captured.out
     assert "OUTBOX DISPATCH SUMMARY" in captured.out
     assert "EXECUTIVE DASHBOARD" in captured.out
+
+
+def test_cli_clean_outbox_and_vacuum(cli_db_path, capsys):
+    """clean-outbox and vacuum CLI subcommands execute cleanly."""
+    exit_clean = main(["--db-path", str(cli_db_path), "clean-outbox", "--days", "30"])
+    assert exit_clean == 0
+    captured_clean = capsys.readouterr()
+    assert "Purged" in captured_clean.out
+
+    exit_vac = main(["--db-path", str(cli_db_path), "vacuum"])
+    assert exit_vac == 0
+    captured_vac = capsys.readouterr()
+    assert "PRAGMA wal_checkpoint(TRUNCATE)" in captured_vac.out

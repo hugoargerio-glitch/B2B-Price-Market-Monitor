@@ -9,7 +9,13 @@ import pytest
 
 from src.config import DatabaseConfig
 from src.diff_engine import compute_entity_key, compute_state_hash
-from src.storage import get_connection, init_db, transaction
+from src.storage import (
+    checkpoint_and_vacuum,
+    get_connection,
+    init_db,
+    purge_dispatched_outbox,
+    transaction,
+)
 
 
 @pytest.fixture
@@ -99,3 +105,55 @@ def test_transaction_rollback_on_error(temp_db):
     cur = temp_db.cursor()
     cur.execute("SELECT COUNT(*) FROM b2b_price_monitor_quarantine WHERE quarantine_id = 'q1';")
     assert cur.fetchone()[0] == 0
+
+
+def test_purge_dispatched_outbox_and_vacuum(temp_db):
+    """Housekeeping purges old DISPATCHED outbox records while keeping recent or PENDING records."""
+    ek = compute_entity_key("domain.com", "SKU-HK")
+    sh = compute_state_hash(1000, "USD", "IN_STOCK")
+    old_iso = "2020-01-01T00:00:00+00:00"
+    recent_iso = "2099-01-01T00:00:00+00:00"
+
+    with transaction(temp_db) as cur:
+        cur.execute(
+            """
+            INSERT INTO product_price_state (
+                entity_key, state_hash, domain, canonical_url, sku,
+                product_title, currency_code, current_price_cents,
+                current_price, availability_status, last_checked_at,
+                last_changed_at, created_at
+            ) VALUES (?, ?, 'domain.com', 'url', 'SKU-HK', 'title', 'USD', 1000, '10.0000', 'IN_STOCK', ?, ?, ?);
+            """,
+            (ek, sh, recent_iso, recent_iso, recent_iso),
+        )
+        # Old DISPATCHED record (should be purged)
+        cur.execute(
+            """
+            INSERT INTO price_change_outbox (
+                outbox_id, entity_key, event_type, payload,
+                notification_status, retry_count, created_at, updated_at
+            ) VALUES ('ob-old', ?, 'PRICE_CHANGE', '{}', 'DISPATCHED', 0, ?, ?);
+            """,
+            (ek, old_iso, old_iso),
+        )
+        # Old PENDING record (must NOT be purged)
+        cur.execute(
+            """
+            INSERT INTO price_change_outbox (
+                outbox_id, entity_key, event_type, payload,
+                notification_status, retry_count, created_at, updated_at
+            ) VALUES ('ob-pending', ?, 'PRICE_CHANGE', '{}', 'PENDING', 0, ?, ?);
+            """,
+            (ek, old_iso, old_iso),
+        )
+
+    deleted = purge_dispatched_outbox(temp_db, retention_days=30)
+    assert deleted == 1
+
+    cur = temp_db.cursor()
+    cur.execute("SELECT outbox_id FROM price_change_outbox;")
+    remaining = [r[0] for r in cur.fetchall()]
+    assert remaining == ["ob-pending"]
+
+    # Verify checkpoint_and_vacuum executes cleanly
+    checkpoint_and_vacuum(temp_db)

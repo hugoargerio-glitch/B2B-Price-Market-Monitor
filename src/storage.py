@@ -185,3 +185,30 @@ def row_to_product_price_state(row: sqlite3.Row) -> ProductPriceState:
         last_changed_at=row["last_changed_at"],
         created_at=row["created_at"],
     )
+
+
+def purge_dispatched_outbox(conn: sqlite3.Connection, retention_days: int = 30) -> int:
+    """Housekeeping: Purge DISPATCHED outbox records older than retention_days."""
+    from datetime import datetime, timedelta, timezone
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    with transaction(conn) as cur:
+        cur.execute(
+            """
+            DELETE FROM price_change_outbox
+            WHERE notification_status = 'DISPATCHED'
+              AND updated_at < ?;
+            """,
+            (cutoff_iso,),
+        )
+        return cur.rowcount
+
+
+def checkpoint_and_vacuum(conn: sqlite3.Connection) -> None:
+    """Housekeeping: Truncate WAL journal and vacuum SQLite database pages."""
+    cursor = conn.cursor()
+    try:
+        cursor.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        cursor.execute("VACUUM;")
+    finally:
+        cursor.close()

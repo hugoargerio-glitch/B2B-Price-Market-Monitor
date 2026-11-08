@@ -3,11 +3,11 @@ Unit tests for Transactional Outbox State Machine in src/outbox.py.
 Verifies PENDING -> DISPATCHED, retry increments, and DEAD_LETTER transitions.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.models import NotificationStatus, OutboxEventType
-from src.outbox import OutboxDispatcher
+from src.outbox import OutboxDispatcher, calculate_backoff_seconds
 from src.storage import get_connection, init_db, transaction
 
 
@@ -118,3 +118,36 @@ def test_outbox_dispatch_batch(outbox_db):
 
     # No more pending events
     assert len(dispatcher.fetch_pending_events()) == 0
+
+
+def test_calculate_backoff_exponential_and_jitter():
+    """Backoff grows exponentially (t_base * 2^retry_count) capped at max_seconds, plus jitter."""
+    assert calculate_backoff_seconds(0) == 0.0
+    assert calculate_backoff_seconds(1, base_seconds=2.0, max_seconds=300.0, with_jitter=False) == 4.0
+    assert calculate_backoff_seconds(3, base_seconds=2.0, max_seconds=300.0, with_jitter=False) == 16.0
+    assert calculate_backoff_seconds(10, base_seconds=2.0, max_seconds=60.0, with_jitter=False) == 60.0
+
+    # With jitter in [0, base_seconds]
+    val = calculate_backoff_seconds(2, base_seconds=2.0, max_seconds=300.0, with_jitter=True)
+    assert 8.0 <= val <= 10.0
+
+
+def test_fetch_pending_events_enforces_backoff(outbox_db):
+    """When enforce_backoff=True, FAILED events must wait until updated_at + backoff window."""
+    dispatcher = OutboxDispatcher(outbox_db, max_retries=5, base_backoff_seconds=2.0)
+    test_ek = "a" * 64
+
+    # Mark ob-1 failed once -> retry_count = 1 -> wait = 2.0 * 2^1 = 4.0s
+    dispatcher.mark_failed("ob-1", test_ek, "HTTP 429 Too Many Requests")
+
+    cur = outbox_db.cursor()
+    cur.execute("SELECT updated_at FROM price_change_outbox WHERE outbox_id = 'ob-1';")
+    updated_at_dt = datetime.fromisoformat(cur.fetchone()[0])
+
+    # 1 second after failure (< 4.0s wait): should be filtered out when enforce_backoff=True
+    early_now = updated_at_dt + timedelta(seconds=1)
+    assert len(dispatcher.fetch_pending_events(enforce_backoff=True, now_utc=early_now)) == 0
+
+    # 5 seconds after failure (>= 4.0s wait): should be eligible
+    ready_now = updated_at_dt + timedelta(seconds=5)
+    assert len(dispatcher.fetch_pending_events(enforce_backoff=True, now_utc=ready_now)) == 1
