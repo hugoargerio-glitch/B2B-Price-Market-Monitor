@@ -5,15 +5,20 @@ BRUIN := /home/Hugo/.local/bin/bruin
 DBT := $(UV) run --offline dbt
 DATACONTRACT := $(UV) run --offline datacontract
 DBT_FLAGS := --project-dir ./dbt_project --profiles-dir ./dbt_project
+PYTHON := $(UV) run python
 
-.PHONY: help setup ingest compile build build-modified init-state contract-lint contract-test validate all
+.PHONY: help setup ingest compile build build-modified init-state contract-lint contract-test validate all simulate dispatch status run
 
 help:
 	@echo "======================================================================"
 	@echo " DE Agentic Boilerplate — Local Data Engineering Commands"
 	@echo "======================================================================"
 	@echo "  make setup          -> Sync Python virtual environment (.venv via uv)"
-	@echo "  make ingest         -> Validate & run Bronze ingestion via Bruin on DuckDB"
+	@echo "  make simulate       -> Simulate market drift & ingest batch into SQLite"
+	@echo "  make ingest         -> Run Bruin ingestion or ingest JSON (make ingest FILE=sample.json)"
+	@echo "  make dispatch       -> Dispatch pending outbox notifications"
+	@echo "  make status         -> Display executive terminal status dashboard"
+	@echo "  make run            -> Complete flow: simulate -> dispatch -> status"
 	@echo "  make build          -> Build & test Silver/Gold models in dbt Core"
 	@echo "  make init-state     -> Save baseline manifest.json to ./target/prod_manifest"
 	@echo "  make compile        -> Compile only modified models (state:modified+)"
@@ -25,9 +30,25 @@ help:
 setup:
 	$(UV) sync
 
+simulate:
+	$(PYTHON) -m src.main simulate
+
+dispatch:
+	$(PYTHON) -m src.main dispatch
+
+status:
+	$(PYTHON) -m src.main status
+
+run:
+	$(PYTHON) -m src.main run
+
 ingest:
+ifdef FILE
+	$(PYTHON) -m src.main ingest --file $(FILE)
+else
 	$(BRUIN) validate ./pipelines/
 	$(BRUIN) run ./pipelines/
+endif
 
 build:
 	$(DBT) build $(DBT_FLAGS)
