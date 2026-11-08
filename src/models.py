@@ -39,7 +39,7 @@ class OutboxEventType(str, Enum):
     AVAILABILITY_CHANGED = "AVAILABILITY_CHANGED"
 
 
-def to_decimal_18_4(val: Any) -> Decimal:
+def to_decimal_18_4(val: Any, allow_negative: bool = False) -> Decimal:
     """Validate and convert value to Decimal with 4 fractional places, forbidding float."""
     if isinstance(val, float):
         raise ValueError(
@@ -52,7 +52,7 @@ def to_decimal_18_4(val: Any) -> Decimal:
         except Exception as e:
             raise ValueError(f"Cannot convert {val!r} to Decimal: {e}") from e
 
-    if val < Decimal("0"):
+    if not allow_negative and val < Decimal("0"):
         raise ValueError(f"Monetary value cannot be negative: {val}")
 
     return val.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
@@ -121,12 +121,19 @@ class ProductPriceState(BaseModel):
     last_changed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-    @field_validator("current_price", "previous_price", "price_delta", "price_delta_percent", mode="before")
+    @field_validator("current_price", "previous_price", mode="before")
     @classmethod
-    def validate_decimal_fields(cls, v: Any) -> Decimal | None:
+    def validate_positive_prices(cls, v: Any) -> Decimal | None:
         if v is None:
             return None
-        return to_decimal_18_4(v) if v >= 0 or isinstance(v, Decimal) else Decimal(str(v)).quantize(Decimal("0.0001"))
+        return to_decimal_18_4(v, allow_negative=False)
+
+    @field_validator("price_delta", "price_delta_percent", mode="before")
+    @classmethod
+    def validate_deltas(cls, v: Any) -> Decimal | None:
+        if v is None:
+            return None
+        return to_decimal_18_4(v, allow_negative=True)
 
     @model_validator(mode="after")
     def verify_cents_parity(self) -> "ProductPriceState":

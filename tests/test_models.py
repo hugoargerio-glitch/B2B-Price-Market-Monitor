@@ -138,3 +138,41 @@ def test_product_price_state_cents_parity_check():
             current_price_cents=99999,  # Intentional discrepancy
             availability_status=AvailabilityStatus.IN_STOCK,
         )
+
+
+def test_product_price_state_negative_deltas_permitted():
+    """Price drops produce negative price_delta and price_delta_percent, which must be permitted."""
+    state = ProductPriceState(
+        entity_key="c" * 64,
+        state_hash="d" * 64,
+        domain="competitor.com",
+        canonical_url="https://competitor.com/p2",
+        sku="SKU-2",
+        product_title="Product On Sale",
+        currency_code="BRL",
+        current_price=Decimal("2500.0000"),
+        current_price_cents=250000,
+        previous_price=Decimal("2700.0000"),
+        price_delta=Decimal("-200.0000"),
+        price_delta_percent=Decimal("-7.4074"),
+        availability_status=AvailabilityStatus.IN_STOCK,
+    )
+    assert state.price_delta == Decimal("-200.0000")
+    assert state.price_delta_percent == Decimal("-7.4074")
+
+
+def test_product_price_state_negative_current_price_rejected():
+    """Current price and previous price can never be negative."""
+    with pytest.raises(ValidationError):
+        ProductPriceState(
+            entity_key="e" * 64,
+            state_hash="f" * 64,
+            domain="competitor.com",
+            canonical_url="https://competitor.com/p3",
+            sku="SKU-3",
+            product_title="Negative Item",
+            currency_code="BRL",
+            current_price=Decimal("-10.0000"),
+            current_price_cents=-1000,
+            availability_status=AvailabilityStatus.IN_STOCK,
+        )
