@@ -1,0 +1,434 @@
+apiVersion: v3.2.0
+kind: DataContract
+id: urn:datacontract:b2b-price-monitor:b2b_price_monitor_v1
+name: b2b_price_monitor_v1
+version: 1.0.0
+status: active
+domain: competitor_intelligence
+dataProduct: b2b_market_price_monitor
+tenant: b2b-monitoring
+description:
+  purpose: >
+    Production-grade state-driven Change Data Capture (CDC) specification for B2B competitor
+    price and stock availability monitoring. Maintains current state per SKU with sub-millisecond
+    lookups, dual-hash state transition tracking, and transactional outbox alerting.
+  limitations: >
+    Stores active state (SCD Type 1) with transactional outbox status. Unparseable HTML payloads,
+    missing mandatory selectors, or template drift are diverted to b2b_price_monitor_quarantine.
+  usage: >
+    Consumed by the Diff Engine for state transition detection and by the transactional outbox
+    dispatcher for webhook alerts (Discord, Slack, Microsoft Teams).
+
+context:
+  instructions: |
+    - MANDATE: Enforce strict 1-row-per-entity_key granularity (entity_key = SHA-256(LOWER(TRIM(domain)) || '::' || UPPER(TRIM(sku)))).
+    - !ANTI_PATTERN: Never use floating-point types (FLOAT/DOUBLE/REAL) for price or monetary amounts; store as DECIMAL(18,4) and BIGINT integer cents.
+    - MANDATE: State hash MUST strictly exclude transient execution metadata (scrape timestamps, latencies, proxy IPs, session tokens) to guarantee zero false positives.
+    - !ANTI_PATTERN: Never trigger notification alerts or update last_changed_at if new_state_hash == current_state_hash.
+    - MANDATE: Outbox notifications must strictly follow ACID state transitions (PENDING -> DISPATCHED | FAILED -> DEAD_LETTER).
+    - MANDATE: Unparseable scrape payloads, missing selectors, or template drift must immediately route to b2b_price_monitor_quarantine.
+  verifiedStatements:
+    - id: entity_key_formula
+      question: "How is the canonical product entity identity key (entity_key) calculated?"
+      answer: "entity_key = SHA-256(LOWER(TRIM(domain)) || '::' || UPPER(TRIM(sku)))"
+      tags: ["identity", "deterministic_key"]
+    - id: state_hash_formula
+      question: "How is the business state signature (state_hash) calculated to prevent false positives?"
+      answer: "state_hash = SHA-256(CAST(current_price_cents AS TEXT) || '|' || UPPER(TRIM(currency_code)) || '|' || UPPER(TRIM(availability_status)) || '|' || COALESCE(TRIM(promo_badge), ''))"
+      tags: ["state_diff", "zero_false_positive"]
+    - id: price_cents_reconciliation
+      question: "How is current_price synchronized with current_price_cents?"
+      answer: "current_price = CAST(current_price_cents AS DECIMAL(18,4)) / 100.0000; CAST(ROUND(current_price * 100, 0) AS BIGINT) == current_price_cents"
+      tags: ["finops", "precision"]
+    - id: price_delta_reconciliation
+      question: "How is price_delta calculated upon state transition?"
+      answer: "price_delta = current_price - COALESCE(previous_price, current_price)"
+      tags: ["delta", "calculation"]
+    - id: price_delta_percent_guarded
+      question: "How is price_delta_percent calculated and guarded against NULL or division by zero?"
+      answer: "CASE WHEN previous_price IS NULL OR previous_price = 0 THEN 0.0000 ELSE CAST(((current_price - previous_price) / previous_price) * 100.0000 AS DECIMAL(18,4)) END"
+      tags: ["delta", "zero_division_guard"]
+  constraints:
+    - id: primary_key_uniqueness
+      constraint: "NEVER allow duplicate entity_key rows; COUNT(*) must strictly equal COUNT(DISTINCT entity_key)."
+      tags: ["grain", "hard_block"]
+    - id: monetary_precision_integrity
+      constraint: "NEVER use FLOAT or DOUBLE; all monetary values must be non-negative DECIMAL(18,4) and BIGINT cents."
+      tags: ["precision", "hard_block"]
+    - id: state_hash_transient_exclusion
+      constraint: "Transient metadata (last_checked_at, proxy_ip, request_latency_ms) MUST NEVER enter state_hash."
+      tags: ["dual_hash", "idempotency"]
+    - id: quarantine_routing_on_drift
+      constraint: "Any unparseable payload or missing required price selector must be routed to b2b_price_monitor_quarantine."
+      tags: ["quarantine", "shift_left_dq"]
+
+servers:
+  - server: local_sqlite
+    type: custom
+    environment: prod
+    database: ./b2b_monitor.db
+    description: "Embedded SQLite single-node database running in WAL mode for microsecond point lookups and transactional outbox persistence."
+    customProperties:
+      - property: engine
+        value: sqlite
+      - property: pragma_journal_mode
+        value: WAL
+      - property: pragma_synchronous
+        value: NORMAL
+      - property: pragma_busy_timeout
+        value: "5000"
+
+schema:
+  - name: b2b_price_monitor
+    physicalName: b2b_price_monitor
+    physicalType: table
+    description: "Current state table (SCD Type 1) with dual-hash CDC state transitions and transactional outbox alerting."
+    dataGranularityDescription: "One unique row per monitored product entity (entity_key)."
+    properties:
+      - name: entity_key
+        businessName: "Product Entity Key (Identity Hash)"
+        logicalType: string
+        physicalType: CHAR(64)
+        semanticType: dimension
+        required: true
+        primaryKey: true
+        primaryKeyPosition: 1
+        unique: true
+        description: "Deterministic SHA-256 hash of domain + '|' + canonical_url_or_sku. B-Tree indexed for sub-millisecond point lookups."
+        classification: internal
+        examples:
+          - "4a5e1e2d3c4b5a6f7e8d9c0b1a2f3e4d5c6b7a8f9e0d1c2b3a4f5e6d7c8b9a0f"
+
+      - name: state_hash
+        businessName: "Business State Signature Hash"
+        logicalType: string
+        physicalType: CHAR(64)
+        semanticType: dimension
+        required: true
+        unique: false
+        description: "Deterministic SHA-256 hash of price_cents + '|' + currency + '|' + availability. Excludes all transient metadata."
+        classification: internal
+        examples:
+          - "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+      - name: domain
+        businessName: "Competitor Domain Name"
+        logicalType: string
+        physicalType: VARCHAR(255)
+        semanticType: dimension
+        required: true
+        description: "Fully qualified domain name of the competitor source."
+        classification: public
+        examples:
+          - "competitor-a.com.br"
+
+      - name: canonical_url
+        businessName: "Normalized Product Canonical URL"
+        logicalType: string
+        physicalType: TEXT
+        semanticType: dimension
+        required: true
+        description: "Cleaned product URL with tracking tokens and session IDs stripped."
+        classification: public
+        examples:
+          - "https://competitor-a.com.br/produtos/laptop-workstation-pro"
+
+      - name: sku
+        businessName: "Product SKU Identifier"
+        logicalType: string
+        physicalType: VARCHAR(128)
+        semanticType: dimension
+        required: true
+        description: "Stock Keeping Unit or vendor catalog product identifier."
+        classification: public
+        examples:
+          - "SKU-PROD-98124"
+
+      - name: product_title
+        businessName: "Product Title / Name"
+        logicalType: string
+        physicalType: VARCHAR(512)
+        semanticType: dimension
+        required: true
+        description: "Cleaned and normalized product name extracted from target page."
+        classification: public
+        examples:
+          - "Laptop Workstation Pro 16 32GB RAM"
+
+      - name: currency_code
+        businessName: "ISO 4217 Currency Code"
+        logicalType: string
+        physicalType: CHAR(3)
+        semanticType: dimension
+        required: true
+        description: "ISO 4217 3-letter currency code."
+        classification: public
+        examples:
+          - "BRL"
+          - "USD"
+
+      - name: current_price_cents
+        businessName: "Current Unit Price in Integer Cents"
+        logicalType: integer
+        physicalType: BIGINT
+        semanticType: measure
+        required: true
+        description: "Exact extracted price stored as integer cents to avoid floating-point rounding drift."
+        classification: internal
+        examples:
+          - 249990
+
+      - name: current_price
+        businessName: "Current Unit Price"
+        logicalType: number
+        physicalType: DECIMAL(18,4)
+        semanticType: measure
+        required: true
+        description: "Normalized monetary price with exact precision (DECIMAL(18,4))."
+        classification: internal
+        examples:
+          - 2499.9000
+
+      - name: previous_price
+        businessName: "Previous Unit Price"
+        logicalType: number
+        physicalType: DECIMAL(18,4)
+        semanticType: measure
+        required: false
+        description: "Monetary price recorded prior to the latest state transition (NULL on initial crawl)."
+        classification: internal
+
+      - name: price_delta
+        businessName: "Absolute Price Delta"
+        logicalType: number
+        physicalType: DECIMAL(18,4)
+        semanticType: measure
+        required: false
+        description: "Absolute difference: current_price - previous_price."
+        classification: internal
+
+      - name: price_delta_percent
+        businessName: "Relative Price Delta Percentage"
+        logicalType: number
+        physicalType: DECIMAL(18,4)
+        semanticType: measure
+        required: false
+        description: "Percentage variance guarded against NULL or zero previous_price: CASE WHEN previous_price IS NULL OR previous_price = 0 THEN 0.0000 ELSE ((current_price - previous_price) / previous_price) * 100.0000 END."
+        classification: internal
+
+      - name: availability_status
+        businessName: "Product Stock Availability Status"
+        logicalType: string
+        physicalType: VARCHAR(32)
+        semanticType: dimension
+        required: true
+        description: "Canonical stock status (IN_STOCK, OUT_OF_STOCK, DISCONTINUED, BACKORDER)."
+        classification: public
+        examples:
+          - "IN_STOCK"
+        quality:
+          - type: sql
+            description: "Enforce closed domain of valid availability statuses."
+            query: "SELECT COUNT(*) FROM {table} WHERE availability_status NOT IN ('IN_STOCK', 'OUT_OF_STOCK', 'DISCONTINUED', 'BACKORDER')"
+            mustBe: 0
+
+      - name: notification_status
+        businessName: "Transactional Outbox Alert Status"
+        logicalType: string
+        physicalType: VARCHAR(32)
+        semanticType: dimension
+        required: true
+        description: "ACID Outbox state machine: PENDING, DISPATCHED, FAILED, DEAD_LETTER."
+        classification: internal
+        examples:
+          - "PENDING"
+          - "DISPATCHED"
+        quality:
+          - type: sql
+            description: "Enforce closed domain of outbox states."
+            query: "SELECT COUNT(*) FROM {table} WHERE notification_status NOT IN ('PENDING', 'DISPATCHED', 'FAILED', 'DEAD_LETTER')"
+            mustBe: 0
+
+      - name: retry_count
+        businessName: "Outbox Dispatch Retry Count"
+        logicalType: integer
+        physicalType: INTEGER
+        semanticType: dimension
+        required: true
+        description: "Number of failed dispatch attempts. Defaults to 0; capped at 5 attempts before transitioning notification_status to DEAD_LETTER."
+        classification: internal
+        examples:
+          - 0
+          - 1
+        customProperties:
+          - property: default_value
+            value: "0"
+        quality:
+          - type: sql
+            description: "Retry count must be non-negative and not exceed 5 attempts."
+            query: "SELECT COUNT(*) FROM {table} WHERE retry_count < 0 OR retry_count > 5"
+            mustBe: 0
+
+      - name: last_notification_error
+        businessName: "Last Outbox Dispatch Error Message"
+        logicalType: string
+        physicalType: VARCHAR(512)
+        semanticType: dimension
+        required: false
+        description: "Diagnostic error message or HTTP response code captured during the most recent failed webhook dispatch attempt."
+        classification: internal
+        examples:
+          - "HTTP 429: Too Many Requests - Rate limit exceeded on Discord webhook"
+
+      - name: last_checked_at
+        businessName: "Heartbeat Scrape Timestamp (UTC)"
+        logicalType: timestamp
+        physicalType: TIMESTAMP WITH TIME ZONE
+        semanticType: dimension
+        required: true
+        description: "Operational heartbeat timestamp updated on every scrape run regardless of state change."
+        classification: internal
+
+      - name: last_changed_at
+        businessName: "State Mutation Timestamp (UTC)"
+        logicalType: timestamp
+        physicalType: TIMESTAMP WITH TIME ZONE
+        semanticType: dimension
+        required: true
+        description: "Business state mutation timestamp updated ONLY when state_hash changes."
+        classification: internal
+
+      - name: created_at
+        businessName: "Initial Record Creation Timestamp (UTC)"
+        logicalType: timestamp
+        physicalType: TIMESTAMP WITH TIME ZONE
+        semanticType: dimension
+        required: true
+        description: "Timestamp when the entity was first discovered and inserted."
+        classification: internal
+
+    quality:
+      - type: library
+        metric: rowCount
+        mustBeGreaterThan: 0
+        description: "The active state store must contain at least one monitored product."
+      - type: library
+        metric: duplicateValues
+        arguments:
+          properties:
+            - entity_key
+        mustBe: 0
+        description: "Deterministic guarantee of entity_key uniqueness (one row per SKU/product)."
+      - type: sql
+        description: "Consistency check between integer cents and decimal price."
+        query: >
+          SELECT COUNT(*)
+          FROM {table}
+          WHERE CAST(ROUND(current_price * 100, 0) AS BIGINT) <> current_price_cents
+        mustBe: 0
+      - type: sql
+        description: "Domain invariant: non-negative prices."
+        query: >
+          SELECT COUNT(*)
+          FROM {table}
+          WHERE current_price < 0 OR current_price_cents < 0
+        mustBe: 0
+
+  - name: b2b_price_monitor_quarantine
+    physicalName: b2b_price_monitor_quarantine
+    physicalType: table
+    description: "Dead Letter Queue (DLQ) table isolating unparseable payloads and template drift."
+    dataGranularityDescription: "One row per failed scrape extraction event."
+    properties:
+      - name: quarantine_id
+        businessName: "Quarantine Event Identifier"
+        logicalType: string
+        physicalType: VARCHAR(64)
+        semanticType: dimension
+        required: true
+        primaryKey: true
+        primaryKeyPosition: 1
+        unique: true
+        description: "Unique event identifier (UUIDv7) for the quarantine entry."
+
+      - name: domain
+        businessName: "Competitor Domain Name"
+        logicalType: string
+        physicalType: VARCHAR(255)
+        semanticType: dimension
+        required: true
+        description: "Domain where the scrape failure occurred."
+
+      - name: raw_url
+        businessName: "Raw Attempted URL"
+        logicalType: string
+        physicalType: TEXT
+        semanticType: dimension
+        required: true
+        description: "Full URL of the page that failed parsing or schema validation."
+
+      - name: raw_payload
+        businessName: "Raw Scraped Payload / Snippet"
+        logicalType: string
+        physicalType: TEXT
+        semanticType: dimension
+        required: false
+        description: "Raw HTML snippet or JSON payload captured at failure time."
+
+      - name: failure_reason
+        businessName: "Failure Reason Code"
+        logicalType: string
+        physicalType: VARCHAR(128)
+        semanticType: dimension
+        required: true
+        description: "Diagnostic reason code: TEMPLATE_DRIFT_MISSING_PRICE, INVALID_CURRENCY, PARSE_EXCEPTION, ANTI_BOT_CHALLENGE."
+
+      - name: quarantined_at
+        businessName: "Quarantine Timestamp (UTC)"
+        logicalType: timestamp
+        physicalType: TIMESTAMP WITH TIME ZONE
+        semanticType: dimension
+        required: true
+        description: "Timestamp when the failed payload was quarantined."
+
+      - name: resolution_status
+        businessName: "Quarantine Resolution Status"
+        logicalType: string
+        physicalType: VARCHAR(32)
+        semanticType: dimension
+        required: true
+        description: "Resolution lifecycle: UNRESOLVED, RESOLVED, IGNORED."
+
+slaProperties:
+  - property: latency
+    value: 5
+    unit: minutes
+    element: b2b_price_monitor.last_checked_at
+    description: "Maximum allowable latency from scrape execution to state store reflection."
+  - property: freshness
+    value: 60
+    unit: minutes
+    element: b2b_price_monitor.last_checked_at
+    description: "Maximum heartbeat polling interval per domain."
+  - property: availability
+    value: 99.9
+    unit: percent
+    description: "Guaranteed uptime for SQLite WAL local store."
+  - property: retention
+    value: 3
+    unit: years
+    description: "Historical state ledger retention period."
+
+customProperties:
+  - property: execution_profile
+    value: "Profile 1: Lean App/CDC (Python + SQLite WAL + Pydantic)"
+  - property: database_file
+    value: "./b2b_monitor.db"
+  - property: pragma_journal_mode
+    value: "WAL"
+  - property: quarantine_table
+    value: "b2b_price_monitor_quarantine"
+  - property: drift_circuit_breaker_threshold
+    value: "0.20"
+  - property: outbox_pattern
+    value: "ACID_TRANSACTIONAL_OUTBOX"

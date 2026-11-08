@@ -1,0 +1,26 @@
+name: 'de_agentic_lakehouse'
+version: '1.0.0'
+config-version: 2
+
+profile: 'de_agentic_lakehouse'
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+vars:
+  pii_hash_salt: "enterprise_salt_2026_finops"
+
+models:
+  de_agentic_lakehouse:
+    silver:
+      +materialized: table
+    gold:
+      +materialized: table

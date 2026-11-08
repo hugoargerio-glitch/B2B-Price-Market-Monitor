@@ -1,0 +1,14 @@
+[project]
+name = "de-agentic-boilerplate-olap"
+version = "1.0.0"
+description = "Enterprise Agentic Data Engineering Boilerplate (Medallion OLAP Lakehouse, Bruin, dbt Core, DuckDB/Iceberg, ODCS v3.2.0)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "dbt-core>=1.9.0",
+    "dbt-duckdb>=1.9.0",
+    "duckdb>=1.1.0",
+    "datacontract-cli[duckdb]>=0.10.14",
+    "pyarrow>=18.0.0",
+    "pytest>=8.3.0",
+]

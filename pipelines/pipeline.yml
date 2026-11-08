@@ -1,0 +1,5 @@
+name: ecommerce_medallion_ingestion
+schedule: hourly
+start_date: "2026-11-01"
+default_connections:
+  duckdb: duckdb-default
