@@ -1,19 +1,22 @@
 """
-Direct verification of all ODCS v3.2.0 quality checks and SQL invariants
-against the physical SQLite database at /home/Hugo/b2b-price-monitor/b2b_monitor.db.
+Hermetic verification of all ODCS v3.2.0 quality checks and SQL invariants
+against an isolated temporary SQLite database populated via seed_database.
 """
 
 from decimal import Decimal
 import sqlite3
 import pytest
 
-from src.config import DEFAULT_DB_PATH
-from src.storage import get_connection
+from src.seed import seed_database
+from src.storage import get_connection, init_db
 
 
-@pytest.fixture(scope="module")
-def prod_db():
-    conn = get_connection(DEFAULT_DB_PATH)
+@pytest.fixture
+def prod_db(tmp_path):
+    """Hermetic SQLite database seeded according to ODCS v3.2.0 contracts."""
+    db_file = tmp_path / "hermetic_contract_test.db"
+    seed_database(db_file)
+    conn = get_connection(db_file)
     yield conn
     conn.close()
 
@@ -41,7 +44,7 @@ def test_contract_price_cents_reconciliation(prod_db):
         """
         SELECT COUNT(*)
         FROM b2b_price_monitor
-        WHERE CAST(ROUND(current_price * 100, 0) AS BIGINT) <> current_price_cents;
+        WHERE CAST(ROUND(CAST(current_price AS REAL) * 100, 0) AS BIGINT) <> current_price_cents;
         """
     )
     mismatches = cur.fetchone()[0]
@@ -55,7 +58,7 @@ def test_contract_non_negative_prices(prod_db):
         """
         SELECT COUNT(*)
         FROM b2b_price_monitor
-        WHERE current_price < 0 OR current_price_cents < 0;
+        WHERE CAST(current_price AS REAL) < 0 OR current_price_cents < 0;
         """
     )
     negatives = cur.fetchone()[0]
@@ -83,7 +86,7 @@ def test_contract_notification_status_domain(prod_db):
         """
         SELECT COUNT(*)
         FROM b2b_price_monitor
-        WHERE notification_status NOT IN ('PENDING', 'DISPATCHED', 'FAILED', 'DEAD_LETTER');
+        WHERE notification_status NOT IN ('PENDING', 'DISPATCHED', 'FAILED', 'DEAD_LETTER', 'CIRCUIT_HALTED');
         """
     )
     invalids = cur.fetchone()[0]
@@ -135,3 +138,23 @@ def test_contract_quarantine_integrity(prod_db):
     )
     invalid_res = cur.fetchone()[0]
     assert invalid_res == 0, f"Found {invalid_res} rows with invalid resolution_status"
+
+
+def test_contract_text_decimal_storage(prod_db):
+    """AUD-006: Monetary decimals in SQLite must be stored physically as TEXT."""
+    cur = prod_db.cursor()
+    cur.execute(
+        """
+        SELECT typeof(current_price), typeof(previous_price), typeof(price_delta), typeof(price_delta_percent)
+        FROM b2b_price_monitor
+        WHERE previous_price IS NOT NULL
+        LIMIT 1;
+        """
+    )
+    row = cur.fetchone()
+    assert row is not None
+    curr_type, prev_type, delta_type, pct_type = row
+    assert curr_type == "text"
+    assert prev_type == "text"
+    assert delta_type == "text"
+    assert pct_type == "text"

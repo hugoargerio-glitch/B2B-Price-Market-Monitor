@@ -38,31 +38,37 @@ We adopt **Profile 1: Lean App/CDC** using `Python + SQLite (WAL Mode) + Pydanti
 1. **Storage Engine — Embedded SQLite with Write-Ahead Logging (WAL)**:
    - File: `./b2b_monitor.db`
    - Config: `PRAGMA journal_mode = WAL;`, `PRAGMA synchronous = NORMAL;`, `PRAGMA busy_timeout = 5000;`.
+   - Single canonical state table: `b2b_price_monitor` (SCD Type 1) alongside `price_change_outbox` (transactional outbox) and `b2b_price_monitor_quarantine` (DLQ).
    - Eliminates 100% of idle RAM consumption from client-server RDBMS; enables microsecond B-Tree index lookups for `entity_key` and non-blocking concurrent reads while writes commit.
 
 2. **Dual-Hash Diff Engine (Zero False-Positive Spikes)**:
    - **Identity Hash (`entity_key`)**:
-     $$\text{entity\_key} = \text{SHA-256}\left(\text{lower}(\text{trim}(\text{domain})) \parallel \text{'\|'} \parallel \text{lower}(\text{trim}(\text{canonical\_url\_or\_sku}))\right)$$
+     $$\text{entity\_key} = \text{SHA-256}\left(\text{lower}(\text{trim}(\text{domain})) \parallel \text{'::'} \parallel \text{upper}(\text{trim}(\text{sku}))\right)$$
+     Canonical formula: `SHA-256(LOWER(TRIM(domain)) || '::' || UPPER(TRIM(sku)))`.
    - **State Signature (`state_hash`)**:
-     $$\text{state\_hash} = \text{SHA-256}\left(\text{CAST}(\text{current\_price\_cents AS VARCHAR}) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{currency\_code})) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{availability\_status}))\right)$$
+     $$\text{state\_hash} = \text{SHA-256}\left(\text{CAST}(\text{current\_price\_cents AS VARCHAR}) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{currency\_code})) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{availability\_status})) \parallel \text{'\|'} \parallel \text{coalesce}(\text{trim}(\text{promo\_badge}), \text{''})\right)$$
+     Captures price in cents, ISO currency, availability status, and nullable campaign tag `promo_badge` (`VARCHAR(128)`).
    - **Strict Exclusion**: Scrape timestamps (`last_checked_at`), page response latency, proxy IPs, user agents, and session cookies are strictly excluded from `state_hash`. Heartbeat runs update only `last_checked_at` without firing alerts.
 
-3. **Strict Monetary Typing**:
-   - Monetary values stored as `DECIMAL(18,4)` and mirrored in integer cents (`BIGINT`).
-   - Floating-point representations (`FLOAT`, `DOUBLE`, `REAL`) are strictly banned to prevent IEEE 754 precision drift.
+3. **Strict Monetary Typing (`TEXT` Physical Storage in SQLite)**:
+   - Monetary values represent logical `DECIMAL(18,4)` and integer cents (`BIGINT` / `INTEGER` `current_price_cents`).
+   - **SQLite Type Affinity Protection**: Because SQLite lacks an arbitrary-precision numeric type and coerces `NUMERIC` / `DECIMAL` column affinities to IEEE 754 `REAL` (floating-point), all logical decimal columns (`current_price`, `previous_price`, `price_delta`, `price_delta_percent`) are persisted physically as `TEXT` in SQLite DDL.
+   - Pydantic v2 models validate and serialize `Decimal` to strings upon database insert/update and re-hydrate `Decimal` instances upon retrieval, guaranteeing zero float drift. Floating-point types (`FLOAT`, `DOUBLE`, `REAL`) remain strictly banned.
 
 4. **Zero-Division & NULL Guard for Price Delta Percentage**:
    $$\text{price\_delta\_percent} = \begin{cases} 0.0000 & \text{if } \text{previous\_price IS NULL or } \text{previous\_price} = 0 \\ \frac{\text{current\_price} - \text{previous\_price}}{\text{previous\_price}} \times 100 & \text{otherwise} \end{cases}$$
 
 5. **ACID Transactional Outbox State Machine**:
-   - Notifications transition through `PENDING` $\rightarrow$ `DISPATCHED` or `FAILED` $\rightarrow$ `DEAD_LETTER`.
+   - Notifications transition through `NotificationStatus`: `PENDING` $\rightarrow$ `DISPATCHED` or `FAILED` $\rightarrow$ `DEAD_LETTER`.
+   - When the domain-level Circuit Breaker trips due to template drift, pending records are marked `CIRCUIT_HALTED` to prevent customer alert leakage while notifying administrators.
+   - Categorized by `OutboxEventType`: `INITIAL_CAPTURE`, `PRICE_CHANGED`, `AVAILABILITY_CHANGED`, and `PROMO_CHANGED`.
    - Physically backed by schema columns: `notification_status VARCHAR(32)`, `retry_count INTEGER DEFAULT 0`, and `last_notification_error VARCHAR(512)`.
-   - Maximum 5 retry attempts with exponential backoff before terminal dead-lettering.
+   - Maximum 5 retry attempts with exponential backoff and jitter before terminal dead-lettering.
 
 6. **Shift-Left Edge Validation & DLQ Isolation**:
    - Pydantic models validate payloads in memory before database touching.
    - Malformed HTML or template drift is diverted to `b2b_price_monitor_quarantine`.
-   - If a domain's quarantine rate exceeds 20%, an automated domain-level Circuit Breaker halts alerts and notifies administrators of template drift.
+   - If a domain's quarantine rate exceeds 20% (with `min_sample_size >= 10`), the automated domain-level Circuit Breaker halts customer alerts (`CIRCUIT_HALTED`) and triggers a `TEMPLATE_DRIFT_DETECTED` administrative alert.
 
 ---
 

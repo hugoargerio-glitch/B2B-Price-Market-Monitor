@@ -1,6 +1,7 @@
 """
 Unit tests for Pydantic domain models in src/models.py.
-Verifies strict Decimal precision, rejection of float, integer cents computation, and enums.
+Verifies strict Decimal precision, rejection of float, integer cents computation,
+enums (including CIRCUIT_HALTED, PROMO_CHANGED), and promo_badge support.
 """
 
 from decimal import Decimal
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 from src.models import (
     AvailabilityStatus,
     NotificationStatus,
+    OutboxEventType,
     ProductPriceState,
     ScrapePayload,
     compute_cents,
@@ -41,6 +43,9 @@ def test_decimal_precision_quantization():
 
     d_str = to_decimal_18_4("499.9999")
     assert str(d_str) == "499.9999"
+
+    d_strip = to_decimal_18_4("  149.9000  ")
+    assert str(d_strip) == "149.9000"
 
 
 def test_compute_cents_round_half_up():
@@ -107,6 +112,12 @@ def test_availability_status_closed_domain():
         )
 
 
+def test_enums_wave1_extensions():
+    """AUD-001 & AUD-014: Ensure CIRCUIT_HALTED and PROMO_CHANGED exist."""
+    assert NotificationStatus.CIRCUIT_HALTED.value == "CIRCUIT_HALTED"
+    assert OutboxEventType.PROMO_CHANGED.value == "PROMO_CHANGED"
+
+
 def test_product_price_state_cents_parity_check():
     """ProductPriceState must enforce ROUND(current_price * 100) == current_price_cents."""
     # Matching
@@ -121,8 +132,10 @@ def test_product_price_state_cents_parity_check():
         current_price=Decimal("123.4500"),
         current_price_cents=12345,
         availability_status=AvailabilityStatus.IN_STOCK,
+        promo_badge="PROMO_10",
     )
     assert state.current_price_cents == 12345
+    assert state.promo_badge == "PROMO_10"
 
     # Mismatching cents
     with pytest.raises(ValidationError, match="does not match"):
@@ -156,9 +169,11 @@ def test_product_price_state_negative_deltas_permitted():
         price_delta=Decimal("-200.0000"),
         price_delta_percent=Decimal("-7.4074"),
         availability_status=AvailabilityStatus.IN_STOCK,
+        promo_badge=None,
     )
     assert state.price_delta == Decimal("-200.0000")
     assert state.price_delta_percent == Decimal("-7.4074")
+    assert state.promo_badge is None
 
 
 def test_product_price_state_negative_current_price_rejected():

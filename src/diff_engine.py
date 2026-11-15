@@ -156,10 +156,19 @@ def evaluate_diff(
     # State transition occurred
     delta, delta_pct = calculate_price_delta(payload.current_price, existing.current_price)
 
-    if payload.current_price_cents != existing.current_price_cents:
+    price_changed = payload.current_price_cents != existing.current_price_cents
+    currency_changed = payload.currency_code.strip().upper() != existing.currency_code.strip().upper()
+    availability_changed = payload.availability_status != existing.availability_status
+    promo_changed = (payload.promo_badge or "").strip() != (existing.promo_badge or "").strip()
+
+    if price_changed or currency_changed:
         event_type = OutboxEventType.PRICE_CHANGED
-    else:
+    elif availability_changed:
         event_type = OutboxEventType.AVAILABILITY_CHANGED
+    elif promo_changed:
+        event_type = OutboxEventType.PROMO_CHANGED
+    else:
+        event_type = OutboxEventType.PRICE_CHANGED
 
     return DiffResult(
         is_new=False,

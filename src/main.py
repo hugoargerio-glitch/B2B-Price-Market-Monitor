@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 from typing import Optional
 
-from src.config import DEFAULT_DB_PATH
+from src.config import DEFAULT_DB_PATH, get_default_db_path
 from src.notifications import WebhookNotifier
 from src.outbox import OutboxDispatcher
 from src.pipeline import PriceMonitorPipeline
@@ -38,7 +38,7 @@ logger = logging.getLogger("b2b_price_monitor.cli")
 
 def cmd_simulate(args: argparse.Namespace) -> int:
     """Run market drift simulation and ingest batch into SQLite pipeline."""
-    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
+    db_path = getattr(args, "db_path", None) or get_default_db_path()
     items_count = getattr(args, "items", 5)
     include_quarantine = getattr(args, "include_quarantine", False)
 
@@ -70,7 +70,7 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 
 def cmd_ingest(args: argparse.Namespace) -> int:
     """Ingest external JSON file containing scrape payloads."""
-    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
+    db_path = getattr(args, "db_path", None) or get_default_db_path()
     file_path = Path(args.file)
 
     if not file_path.exists():
@@ -111,12 +111,20 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
     """Fetch pending outbox events and dispatch via WebhookNotifier."""
-    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
+    db_path = getattr(args, "db_path", None) or get_default_db_path()
     limit = getattr(args, "limit", 50)
     dry_run = getattr(args, "dry_run", False)
 
     conn = get_connection(db_path)
-    init_db(conn)
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('b2b_price_monitor', 'price_change_outbox');")
+        tables_exist = cur.fetchone()[0] == 2
+    finally:
+        cur.close()
+
+    if not tables_exist:
+        init_db(conn)
 
     notifier = WebhookNotifier(dry_run=dry_run)
     dispatcher = OutboxDispatcher(conn)
@@ -138,12 +146,20 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     """Display an executive terminal status dashboard."""
-    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
-    conn = get_connection(db_path)
-    init_db(conn)
+    db_path = Path(getattr(args, "db_path", None) or get_default_db_path())
 
+    if not db_path.exists():
+        print(f"\nℹ️ Database file '{db_path}' does not exist yet. Run 'simulate' or 'seed' to initialize.")
+        return 0
+
+    conn = get_connection(db_path)
     cur = conn.cursor()
     try:
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='b2b_price_monitor';")
+        if not cur.fetchone():
+            print(f"\nℹ️ Table 'b2b_price_monitor' not found in '{db_path}'. Database is uninitialized. Run 'simulate' or 'seed' first.")
+            return 0
+
         cur.execute("SELECT COUNT(*), COUNT(DISTINCT domain) FROM b2b_price_monitor;")
         total_skus, total_domains = cur.fetchone()
 
@@ -155,20 +171,29 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         total_changes = cur.fetchone()[0]
 
-        cur.execute(
-            """
-            SELECT notification_status, COUNT(*)
-            FROM price_change_outbox
-            GROUP BY notification_status;
-            """
-        )
-        outbox_counts = {r[0]: r[1] for r in cur.fetchall()}
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='price_change_outbox';")
+        if cur.fetchone():
+            cur.execute(
+                """
+                SELECT notification_status, COUNT(*)
+                FROM price_change_outbox
+                GROUP BY notification_status;
+                """
+            )
+            outbox_counts = {r[0]: r[1] for r in cur.fetchall()}
+        else:
+            outbox_counts = {}
 
-        cur.execute("SELECT COUNT(*) FROM b2b_price_monitor_quarantine;")
-        total_quarantine = cur.fetchone()[0]
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='b2b_price_monitor_quarantine';")
+        if cur.fetchone():
+            cur.execute("SELECT COUNT(*) FROM b2b_price_monitor_quarantine;")
+            total_quarantine = cur.fetchone()[0]
 
-        cur.execute("SELECT COUNT(*) FROM b2b_price_monitor_quarantine WHERE resolution_status = 'UNRESOLVED';")
-        unresolved_quarantine = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM b2b_price_monitor_quarantine WHERE resolution_status = 'UNRESOLVED';")
+            unresolved_quarantine = cur.fetchone()[0]
+        else:
+            total_quarantine = 0
+            unresolved_quarantine = 0
 
     finally:
         cur.close()
@@ -204,11 +229,32 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("=" * 78 + "\n")
 
     return 0
+    print("  Storage Engine     : SQLite 3 (WAL Mode, synchronous=NORMAL)")
+    print("  Execution Profile  : Profile 1 (Lean App / CDC Engine)")
+    print("  Contract Spec      : ODCS v3.2.0 (competitor_intelligence)")
+    print("-" * 78)
+    print("  📊 MONITORED INVENTORY")
+    print(f"     • Active Tracked SKUs        : {total_skus}")
+    print(f"     • Competitor Domains         : {total_domains}")
+    print(f"     • State Drift Mutations      : {total_changes}")
+    print("-" * 78)
+    print("  📬 TRANSACTIONAL OUTBOX QUEUE")
+    print(f"     • Dispatched Alerts          : {dispatched}")
+    print(f"     • Pending Outbox Alerts      : {pending}")
+    print(f"     • Retrying Failures          : {failed}")
+    print(f"     • Dead-Letter (Max Retries)  : {dead_letter}")
+    print("-" * 78)
+    print("  🛡️ QUARANTINE DLQ (SHIFT-LEFT EDGE VALIDATION)")
+    print(f"     • Total Quarantined Events   : {total_quarantine}")
+    print(f"     • Unresolved Incidents       : {unresolved_quarantine}")
+    print("=" * 78 + "\n")
+
+    return 0
 
 
 def cmd_clean_outbox(args: argparse.Namespace) -> int:
     """Purge DISPATCHED outbox records older than retention days."""
-    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
+    db_path = getattr(args, "db_path", None) or get_default_db_path()
     retention_days = getattr(args, "days", 30)
 
     conn = get_connection(db_path)
@@ -222,7 +268,7 @@ def cmd_clean_outbox(args: argparse.Namespace) -> int:
 
 def cmd_vacuum(args: argparse.Namespace) -> int:
     """Truncate WAL journal and vacuum SQLite database pages."""
-    db_path = getattr(args, "db_path", DEFAULT_DB_PATH)
+    db_path = getattr(args, "db_path", None) or get_default_db_path()
 
     conn = get_connection(db_path)
     init_db(conn)
@@ -252,6 +298,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct command-line interface arguments."""
+    default_db = get_default_db_path()
     parser = argparse.ArgumentParser(
         prog="b2b-price-monitor",
         description="B2B Competitor Price & Market Monitor CLI (ODCS v3.2.0 Profile 1)",
@@ -259,8 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--db-path",
         type=str,
-        default=str(DEFAULT_DB_PATH),
-        help=f"Path to SQLite database (default: {DEFAULT_DB_PATH})",
+        default=str(default_db),
+        help=f"Path to SQLite database (default: {default_db})",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")

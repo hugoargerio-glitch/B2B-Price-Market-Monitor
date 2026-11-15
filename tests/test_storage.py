@@ -1,6 +1,7 @@
 """
 Unit tests for SQLite storage layer in src/storage.py.
-Verifies WAL mode, PRAGMAs, table DDL, indexes, and primary key uniqueness.
+Verifies WAL mode, PRAGMAs, single table DDL, TEXT decimal storage,
+indexes, and primary key uniqueness.
 """
 
 from decimal import Decimal
@@ -41,25 +42,25 @@ def test_sqlite_wal_mode_and_pragmas(temp_db):
 
 
 def test_table_creation(temp_db):
-    """Tables defined in schema must exist."""
+    """Canonical tables must exist and legacy product_price_state must be removed (AUD-007)."""
     cur = temp_db.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
     tables = {r[0] for r in cur.fetchall()}
-    assert "product_price_state" in tables
+    assert "b2b_price_monitor" in tables
     assert "price_change_outbox" in tables
     assert "b2b_price_monitor_quarantine" in tables
-    assert "b2b_price_monitor" in tables
+    assert "product_price_state" not in tables
 
 
 def test_primary_key_uniqueness(temp_db):
-    """entity_key primary key uniqueness must be strictly enforced."""
+    """entity_key primary key uniqueness must be strictly enforced on b2b_price_monitor."""
     ek = compute_entity_key("domain.com", "SKU-001")
     sh = compute_state_hash(1000, "USD", "IN_STOCK")
 
     with transaction(temp_db) as cur:
         cur.execute(
             """
-            INSERT INTO product_price_state (
+            INSERT INTO b2b_price_monitor (
                 entity_key, state_hash, domain, canonical_url, sku,
                 product_title, currency_code, current_price_cents,
                 current_price, availability_status, last_checked_at,
@@ -74,7 +75,7 @@ def test_primary_key_uniqueness(temp_db):
         with transaction(temp_db) as cur:
             cur.execute(
                 """
-                INSERT INTO product_price_state (
+                INSERT INTO b2b_price_monitor (
                     entity_key, state_hash, domain, canonical_url, sku,
                     product_title, currency_code, current_price_cents,
                     current_price, availability_status, last_checked_at,
@@ -82,6 +83,60 @@ def test_primary_key_uniqueness(temp_db):
                 ) VALUES (?, ?, 'domain.com', 'url', 'SKU-001', 'title', 'USD', 1000, '10.0000', 'IN_STOCK', '2026-11-08T00:00:00Z', '2026-11-08T00:00:00Z', '2026-11-08T00:00:00Z');
                 """,
                 (ek, sh),
+            )
+
+
+def test_decimal_storage_as_text(temp_db):
+    """AUD-006: Monetary decimals in b2b_price_monitor must be stored as TEXT."""
+    ek = compute_entity_key("domain.com", "SKU-DEC-01")
+    sh = compute_state_hash(249990, "BRL", "IN_STOCK", promo_badge="DESCONTO")
+
+    with transaction(temp_db) as cur:
+        cur.execute(
+            """
+            INSERT INTO b2b_price_monitor (
+                entity_key, state_hash, domain, canonical_url, sku,
+                product_title, currency_code, current_price_cents,
+                current_price, previous_price, price_delta, price_delta_percent,
+                availability_status, promo_badge, last_checked_at, last_changed_at, created_at
+            ) VALUES (?, ?, 'domain.com', 'url', 'SKU-DEC-01', 'title', 'BRL', 249990,
+                      '2499.9000', '2699.9000', '-200.0000', '-7.4074',
+                      'IN_STOCK', 'DESCONTO', '2026-11-08T00:00:00Z', '2026-11-08T00:00:00Z', '2026-11-08T00:00:00Z');
+            """,
+            (ek, sh),
+        )
+
+    cur = temp_db.cursor()
+    cur.execute(
+        """
+        SELECT typeof(current_price), typeof(previous_price), typeof(price_delta), typeof(price_delta_percent),
+               promo_badge
+        FROM b2b_price_monitor
+        WHERE entity_key = ?;
+        """,
+        (ek,),
+    )
+    row = cur.fetchone()
+    assert row[0] == "text"
+    assert row[1] == "text"
+    assert row[2] == "text"
+    assert row[3] == "text"
+    assert row[4] == "DESCONTO"
+
+
+def test_foreign_key_to_b2b_price_monitor(temp_db):
+    """AUD-007: price_change_outbox FK must enforce presence in b2b_price_monitor."""
+    non_existent_ek = "f" * 64
+    with pytest.raises(sqlite3.IntegrityError):
+        with transaction(temp_db) as cur:
+            cur.execute(
+                """
+                INSERT INTO price_change_outbox (
+                    outbox_id, entity_key, event_type, payload,
+                    notification_status, retry_count, created_at, updated_at
+                ) VALUES ('ob-fail', ?, 'INITIAL_CAPTURE', '{}', 'PENDING', 0, '2026-11-08T00:00:00Z', '2026-11-08T00:00:00Z');
+                """,
+                (non_existent_ek,),
             )
 
 
@@ -117,7 +172,7 @@ def test_purge_dispatched_outbox_and_vacuum(temp_db):
     with transaction(temp_db) as cur:
         cur.execute(
             """
-            INSERT INTO product_price_state (
+            INSERT INTO b2b_price_monitor (
                 entity_key, state_hash, domain, canonical_url, sku,
                 product_title, currency_code, current_price_cents,
                 current_price, availability_status, last_checked_at,

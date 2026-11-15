@@ -1,12 +1,14 @@
 """
 Unit tests for Webhook Notifier in src/notifications.py.
 Verifies Discord embeds (colors for drop/increase/availability), Slack Block Kit,
-console fallback, platform auto-detection, and dispatch success/failure handling.
+console fallback, platform auto-detection, B2B_WEBHOOK_URL env resolution,
+and dispatch success/failure handling.
 """
 
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
+import os
 from unittest.mock import MagicMock, patch
 import urllib.error
 
@@ -37,6 +39,7 @@ def sample_outbox_event():
         "price_delta_percent": "-7.4077",
         "currency": "BRL",
         "availability": "IN_STOCK",
+        "promo_badge": "FRETE_GRATIS",
     }
     return PriceChangeOutbox(
         outbox_id="test-outbox-uuid-1",
@@ -68,6 +71,27 @@ def test_platform_auto_detection():
         platform="console",
     )
     assert notifier_override.platform == "console"
+
+
+def test_b2b_webhook_url_env_resolution(monkeypatch):
+    """AUD-003: WebhookNotifier resolves B2B_WEBHOOK_URL, then ALERT_WEBHOOK_URL fallback."""
+    # When B2B_WEBHOOK_URL is set
+    monkeypatch.setenv("B2B_WEBHOOK_URL", "https://discord.com/api/webhooks/b2b/test")
+    monkeypatch.delenv("ALERT_WEBHOOK_URL", raising=False)
+    notifier1 = WebhookNotifier()
+    assert notifier1.webhook_url == "https://discord.com/api/webhooks/b2b/test"
+    assert notifier1.platform == "discord"
+
+    # When B2B_WEBHOOK_URL is empty, fall back to ALERT_WEBHOOK_URL
+    monkeypatch.delenv("B2B_WEBHOOK_URL", raising=False)
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hooks.slack.com/services/alert/test")
+    notifier2 = WebhookNotifier()
+    assert notifier2.webhook_url == "https://hooks.slack.com/services/alert/test"
+    assert notifier2.platform == "slack"
+
+    # Explicit webhook_url override takes highest precedence
+    notifier3 = WebhookNotifier(webhook_url="https://discord.com/api/webhooks/explicit")
+    assert notifier3.webhook_url == "https://discord.com/api/webhooks/explicit"
 
 
 def test_discord_formatting_price_decrease(sample_outbox_event):

@@ -1,6 +1,7 @@
 """
 Unit tests for Transactional Outbox State Machine in src/outbox.py.
-Verifies PENDING -> DISPATCHED, retry increments, and DEAD_LETTER transitions.
+Verifies PENDING -> DISPATCHED, retry increments, DEAD_LETTER transitions,
+CIRCUIT_HALTED non-leakage, and enforced backoff/jitter.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -19,20 +20,9 @@ def outbox_db(tmp_path):
     now_iso = datetime.now(timezone.utc).isoformat()
     test_ek = "a" * 64
     test_sh = "b" * 64
-    # Seed an entity and outbox events
+
+    # Seed an entity and outbox events in canonical b2b_price_monitor table
     with transaction(conn) as cur:
-        cur.execute(
-            """
-            INSERT INTO product_price_state (
-                entity_key, state_hash, domain, canonical_url, sku,
-                product_title, currency_code, current_price_cents,
-                current_price, availability_status, last_checked_at,
-                last_changed_at, created_at
-            ) VALUES (?, ?, 'competitor.com', 'url', 'SKU-TEST',
-                      'Title', 'USD', 1000, '10.0000', 'IN_STOCK', ?, ?, ?);
-            """,
-            (test_ek, test_sh, now_iso, now_iso, now_iso),
-        )
         cur.execute(
             """
             INSERT INTO b2b_price_monitor (
@@ -51,7 +41,7 @@ def outbox_db(tmp_path):
             INSERT INTO price_change_outbox (
                 outbox_id, entity_key, event_type, payload,
                 notification_status, retry_count, created_at, updated_at
-            ) VALUES ('ob-1', ?, 'INITIAL_CAPTURE', '{"price": 10.0}',
+            ) VALUES ('ob-1', ?, 'INITIAL_CAPTURE', '{"price": "10.0000"}',
                       'PENDING', 0, ?, ?);
             """,
             (test_ek, now_iso, now_iso),
@@ -107,7 +97,7 @@ def test_outbox_failure_retry_and_dead_letter(outbox_db):
 
 
 def test_outbox_dispatch_batch(outbox_db):
-    """dispatch_batch invokes sender and records metrics."""
+    """dispatch_batch invokes sender and records metrics with enforced backoff by default."""
     dispatcher = OutboxDispatcher(outbox_db)
 
     # Test with successful sender
@@ -133,7 +123,7 @@ def test_calculate_backoff_exponential_and_jitter():
 
 
 def test_fetch_pending_events_enforces_backoff(outbox_db):
-    """When enforce_backoff=True, FAILED events must wait until updated_at + backoff window."""
+    """When enforce_backoff=True (default), FAILED events must wait until updated_at + backoff window."""
     dispatcher = OutboxDispatcher(outbox_db, max_retries=5, base_backoff_seconds=2.0)
     test_ek = "a" * 64
 
@@ -146,8 +136,62 @@ def test_fetch_pending_events_enforces_backoff(outbox_db):
 
     # 1 second after failure (< 4.0s wait): should be filtered out when enforce_backoff=True
     early_now = updated_at_dt + timedelta(seconds=1)
+    assert len(dispatcher.fetch_pending_events(now_utc=early_now)) == 0
     assert len(dispatcher.fetch_pending_events(enforce_backoff=True, now_utc=early_now)) == 0
 
     # 5 seconds after failure (>= 4.0s wait): should be eligible
     ready_now = updated_at_dt + timedelta(seconds=5)
-    assert len(dispatcher.fetch_pending_events(enforce_backoff=True, now_utc=ready_now)) == 1
+    assert len(dispatcher.fetch_pending_events(now_utc=ready_now)) == 1
+
+
+def test_circuit_halted_rows_never_fetched_for_dispatch(outbox_db):
+    """AUD-001: CIRCUIT_HALTED events must NEVER leak to customer webhook dispatch."""
+    dispatcher = OutboxDispatcher(outbox_db)
+    test_ek = "a" * 64
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    with transaction(outbox_db) as cur:
+        # Event marked CIRCUIT_HALTED
+        cur.execute(
+            """
+            INSERT INTO price_change_outbox (
+                outbox_id, entity_key, event_type, payload,
+                notification_status, retry_count, last_notification_error, created_at, updated_at
+            ) VALUES ('ob-ch1', ?, 'PRICE_CHANGED', '{"price": "10.0000"}',
+                      'CIRCUIT_HALTED', 0, 'HALTED_BY_CIRCUIT_BREAKER', ?, ?);
+            """,
+            (test_ek, now_iso, now_iso),
+        )
+        # Event with FAILED status but HALTED_BY_CIRCUIT_BREAKER error
+        cur.execute(
+            """
+            INSERT INTO price_change_outbox (
+                outbox_id, entity_key, event_type, payload,
+                notification_status, retry_count, last_notification_error, created_at, updated_at
+            ) VALUES ('ob-ch2', ?, 'PRICE_CHANGED', '{"price": "10.0000"}',
+                      'FAILED', 0, 'HALTED_BY_CIRCUIT_BREAKER', ?, ?);
+            """,
+            (test_ek, now_iso, now_iso),
+        )
+
+    # Fetch pending events must strictly exclude ob-ch1 and ob-ch2
+    pending = dispatcher.fetch_pending_events(enforce_backoff=False)
+    pending_ids = [ev.outbox_id for ev in pending]
+    assert "ob-ch1" not in pending_ids
+    assert "ob-ch2" not in pending_ids
+    assert pending_ids == ["ob-1"]
+
+
+def test_error_message_token_scrubbing(outbox_db):
+    """Webhook tokens must be scrubbed when saving last_notification_error."""
+    dispatcher = OutboxDispatcher(outbox_db)
+    test_ek = "a" * 64
+
+    sensitive_error = "HTTP 404 from https://discord.com/api/webhooks/123456/SECRET_TOKEN_XYZ"
+    dispatcher.mark_failed("ob-1", test_ek, sensitive_error)
+
+    cur = outbox_db.cursor()
+    cur.execute("SELECT last_notification_error FROM price_change_outbox WHERE outbox_id = 'ob-1';")
+    err = cur.fetchone()[0]
+    assert "SECRET_TOKEN_XYZ" not in err
+    assert "***" in err

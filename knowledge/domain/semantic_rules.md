@@ -20,11 +20,13 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 
 | Table | Storage Engine | Atomic Grain | Primary Key | State / Retention Model |
 | :--- | :--- | :--- | :--- | :--- |
-| `b2b_price_monitor` | SQLite (WAL Mode) | **1 row per monitored product entity** | `entity_key` | Current State (SCD Type 1) + Outbox Queue |
+| `b2b_price_monitor` | SQLite (WAL Mode) | **1 row per monitored product entity** | `entity_key` | Current State (SCD Type 1) Single Canonical State Store |
+| `price_change_outbox` | SQLite (WAL Mode) | 1 row per state mutation event | `outbox_id` | Transactional Outbox Queue (30-Day Operational Retention) |
 | `b2b_price_monitor_quarantine` | SQLite (WAL Mode) | 1 row per failed extraction / validation | `quarantine_id` | Dead Letter Queue (DLQ) Append-Only |
 
 ### Storage Engine Constraints
 - **MANDATE**: Operate on embedded SQLite (`database: ./b2b_monitor.db`) running with `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA busy_timeout = 5000` to support non-blocking concurrent reads and resilient single-node execution.
+- **MANDATE**: `b2b_price_monitor` is the single canonical state table. Legacy aliases (such as `product_price_state`) are strictly prohibited across schemas, models, and queries.
 - **!ANTI_PATTERN**: Never run SQLite in default `DELETE` rollback journal mode, as concurrent reads during scrape ingestion will raise `database is locked` exceptions.
 
 ---
@@ -32,10 +34,11 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 ## 2. Dual-Hash Diff Engine & Zero False-Positive Guarantees
 
 ### 2.1. Identity Key vs. State Signature
-- **MANDATE**: Compute `entity_key` as `SHA-256(lower(trim(domain)) || '|' || lower(trim(canonical_url_or_sku)))` and index it via a unique B-Tree index to guarantee sub-millisecond point lookups (`SELECT state_hash, current_price_cents FROM b2b_price_monitor WHERE entity_key = ?`).
+- **MANDATE**: Compute `entity_key` as `SHA-256(LOWER(TRIM(domain)) || '::' || UPPER(TRIM(sku)))` and index it via a unique B-Tree index to guarantee sub-millisecond point lookups (`SELECT state_hash, current_price_cents FROM b2b_price_monitor WHERE entity_key = ?`).
 - **!ANTI_PATTERN**: Never use raw, un-normalized URLs or mutable catalog titles as primary keys, as trailing slashes, URL tracking parameters (`utm_*`, `ref`), and copywriting adjustments create orphan entity duplicates.
 - **MANDATE**: Compute `state_hash` strictly and exclusively from business state attributes:
-  $$\text{state\_hash} = \text{SHA-256}\left(\text{CAST}(\text{current\_price\_cents AS VARCHAR}) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{currency\_code})) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{availability\_status}))\right)$$
+  $$\text{state\_hash} = \text{SHA-256}\left(\text{CAST}(\text{current\_price\_cents AS VARCHAR}) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{currency\_code})) \parallel \text{'\|'} \parallel \text{upper}(\text{trim}(\text{availability\_status})) \parallel \text{'\|'} \parallel \text{COALESCE}(\text{trim}(\text{promo\_badge}), \text{''})\right)$$
+  The formula encapsulates integer price cents, ISO currency, availability status, and campaign badge `promo_badge` (`VARCHAR(128)`, nullable).
 - **!ANTI_PATTERN**: Never include transient metadata (scrape timestamps like `last_checked_at`, request latencies, proxy IP addresses, or HTTP session cookies) inside the `state_hash` formula, which would invalidate state parity on subsequent runs and trigger false-positive alert floods.
 
 ### 2.2. State Transition & Heartbeat Logic
@@ -45,6 +48,9 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
     - `previous_price = current_price`
     - `current_price = new_price`
     - `current_price_cents = new_price_cents`
+    - `currency_code = new_currency_code`
+    - `availability_status = new_availability_status`
+    - `promo_badge = new_promo_badge`
     - `price_delta = new_price - current_price`
     - `price_delta_percent = CASE WHEN current_price IS NULL OR current_price = 0 THEN 0.0000 ELSE CAST(((new_price - current_price) / current_price) * 100.0000 AS DECIMAL(18,4)) END`
     - `state_hash = new_state_hash`
@@ -60,7 +66,8 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 ## 3. Monetary Precision & Calculation Formulas
 
 ### 3.1. Typing & Arithmetic Constraints
-- **MANDATE**: Store all monetary values as `DECIMAL(18,4)` and mirror them in integer cents (`BIGINT`) for exact arithmetic.
+- **MANDATE**: Store all monetary values logically as `DECIMAL(18,4)` and mirror them in integer cents (`BIGINT` `current_price_cents`) for exact arithmetic.
+- **MANDATE (SQLite `TEXT` Physical Storage)**: Because SQLite lacks an arbitrary-precision numeric data type and automatically coerces `NUMERIC` / `DECIMAL` affinities to IEEE 754 `REAL` (floating-point), all logical decimal columns (`current_price`, `previous_price`, `price_delta`, `price_delta_percent`) are persisted physically as `TEXT` in SQLite DDL.
 - **!ANTI_PATTERN**: Never use floating-point primitives (`FLOAT`, `DOUBLE`, `REAL`) for unit prices or deltas; all comparison and diff logic must operate on integer cents (`current_price_cents`) or fixed-point decimals.
 - **MANDATE**: Ensure that `CAST(ROUND(current_price * 100, 0) AS BIGINT) == current_price_cents` holds invariant across 100% of rows.
 - **!ANTI_PATTERN**: Never allow negative values in `current_price` or `current_price_cents`.
@@ -84,13 +91,20 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 
 ## 4. ACID Transactional Outbox State Machine (5-Attempt Queue)
 
-- **MANDATE**: Manage notification dispatch via a strict 4-state finite state machine physically backed by schema columns (`notification_status`, `retry_count`, `last_notification_error`):
+- **MANDATE**: Categorize all state mutations by canonical `OutboxEventType`:
+  - `INITIAL_CAPTURE`: First discovery of a monitored SKU entity.
+  - `PRICE_CHANGED`: Unit price or integer cents mutated.
+  - `AVAILABILITY_CHANGED`: Stock status mutated (e.g. `IN_STOCK` -> `OUT_OF_STOCK`).
+  - `PROMO_CHANGED`: Promotional campaign badge mutated.
+- **MANDATE**: Manage notification dispatch via a strict 5-state finite state machine physically backed by schema columns (`notification_status`, `retry_count`, `last_notification_error`):
   1. `PENDING`: Initial state set atomically by the Diff Engine when `new_state_hash != existing_state_hash`.
   2. `DISPATCHED`: Final success state stamped when the target webhook endpoint (Discord, Slack, MS Teams) returns HTTP 200/204.
   3. `FAILED`: Intermediate retry state stamped when webhook dispatch encounters a transient failure (HTTP 429 rate limit, HTTP 5xx, or network timeout).
      - Each failed attempt increments `retry_count = retry_count + 1` and records the error snippet in `last_notification_error`.
-     - Retries must execute with exponential backoff ($1\text{s}, 2\text{s}, 4\text{s}, 8\text{s}, 16\text{s}$).
-  4. `DEAD_LETTER`: Terminal failure state stamped when `retry_count >= 5`. Emits an administrative alert and halts retries for that event.
+     - Retries must execute with exponential backoff and jitter ($1\text{s}, 2\text{s}, 4\text{s}, 8\text{s}, 16\text{s}$).
+  4. `DEAD_LETTER`: Terminal failure state stamped when `retry_count >= 5`. Emits an administrative alert and halts automated retries for that event.
+  5. `CIRCUIT_HALTED`: Isolation state stamped when the domain-level Circuit Breaker trips due to template drift (`> 20%` failure rate with `min_sample_size >= 10`), preventing customer-facing alert leakage while an administrative alert is emitted.
+- **MANDATE (30-Day Operational Retention)**: Outbox events marked `DISPATCHED` are retained for an operational SLA window of 30 days before routine automated purging via `purge_dispatched_outbox(conn, retention_days=30)`.
 - **!ANTI_PATTERN**: Never perform synchronous webhook dispatch within the scraper loop; notification dispatch must be decoupled through the Outbox queue to prevent scraper blocking or state corruption on webhook failures.
 - **!ANTI_PATTERN**: Never leave a failed notification in `PENDING` without recording retry counters or transition to `FAILED` / `DEAD_LETTER`.
 
@@ -100,5 +114,5 @@ This **Open Knowledge Format (OKF)** document defines the institutional single s
 
 - **MANDATE**: Validate all extracted scrape payloads in-memory against the Pydantic schema before invoking the Diff Engine. Any missing mandatory selectors (price, availability) or parsing exceptions must be diverted immediately to `b2b_price_monitor_quarantine` with `quarantine_id = UUIDv7`, `raw_url`, `raw_payload`, and diagnostic `failure_reason`.
 - **!ANTI_PATTERN**: Never write raw unvalidated HTML snippets, `NULL` prices, or zero-price fallbacks directly into `b2b_price_monitor`, as this corrupts the baseline state and triggers erroneous price-drop alerts.
-- **MANDATE**: Enforce a domain-level Circuit Breaker: if the scrape failure/quarantine rate for a domain exceeds 20% of its target catalog in a single run, halt webhook alerting for that domain and trigger a high-priority `TEMPLATE_DRIFT_DETECTED` administrative notification.
+- **MANDATE**: Enforce a domain-level Circuit Breaker: if the scrape failure/quarantine rate for a domain exceeds 20% of its target catalog in a single run (with `min_sample_size >= 10`), halt customer webhook alerting for that domain (`notification_status = 'CIRCUIT_HALTED'`) and trigger a high-priority `TEMPLATE_DRIFT_DETECTED` administrative notification.
 - **!ANTI_PATTERN**: Never allow automated crawlers to continue sending customer-facing alerts when template drift is detected on the target site.

@@ -14,15 +14,16 @@ from typing import Any, Optional
 import urllib.error
 import urllib.request
 
+from src.config import PROJECT_ROOT
 from src.models import NotificationStatus, OutboxEventType, PriceChangeOutbox
 
 # Attempt to load .env if present
 try:
     from dotenv import load_dotenv
 
-    env_path = Path("/home/Hugo/b2b-price-monitor/.env")
+    env_path = PROJECT_ROOT / ".env"
     if env_path.exists():
-        load_dotenv(env_path)
+        load_dotenv(env_path, override=False)
 except ImportError:
     pass
 
@@ -48,7 +49,7 @@ class WebhookNotifier:
         self.webhook_url = (
             webhook_url
             if webhook_url is not None
-            else os.getenv("ALERT_WEBHOOK_URL", "")
+            else (os.getenv("B2B_WEBHOOK_URL") or os.getenv("ALERT_WEBHOOK_URL", ""))
         ).strip()
         configured_platform = (
             platform

@@ -6,30 +6,25 @@ atomic SQLite transactions, DLQ quarantine routing, and Domain Circuit Breakers.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from decimal import Decimal
 import json
 import logging
 import sqlite3
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from pydantic import ValidationError
 
 from src.config import CircuitBreakerConfig
 from src.diff_engine import (
-    calculate_price_delta,
     compute_entity_key,
-    compute_state_hash,
     evaluate_diff,
 )
 from src.models import (
-    AvailabilityStatus,
     NotificationStatus,
     OutboxEventType,
     ProductPriceState,
     QuarantineRecord,
     ScrapePayload,
-    to_decimal_18_4,
 )
 from src.storage import row_to_product_price_state, transaction
 
@@ -62,9 +57,12 @@ class PriceMonitorPipeline:
         self,
         conn: sqlite3.Connection,
         circuit_breaker_config: Optional[CircuitBreakerConfig] = None,
+        admin_notifier: Optional[Callable[[dict[str, Any]], Any]] = None,
+        notifier: Optional[Any] = None,
     ):
         self.conn = conn
         self.cb_config = circuit_breaker_config or CircuitBreakerConfig()
+        self.admin_notifier = admin_notifier if admin_notifier is not None else notifier
 
     def quarantine_payload(
         self,
@@ -103,28 +101,35 @@ class PriceMonitorPipeline:
             )
         return record
 
-    def get_existing_state(self, entity_key: str) -> Optional[ProductPriceState]:
+    def get_existing_state(
+        self,
+        entity_key: str,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> Optional[ProductPriceState]:
         """Lookup existing entity state by entity_key using SQLite B-Tree index."""
-        cursor = self.conn.cursor()
+        own_cursor = cursor is None
+        cur = self.conn.cursor() if own_cursor else cursor
         try:
-            cursor.execute(
+            cur.execute(
                 """
                 SELECT entity_key, state_hash, domain, canonical_url, sku,
                        product_title, currency_code, current_price_cents,
                        current_price, previous_price, price_delta,
-                       price_delta_percent, availability_status,
+                       price_delta_percent, availability_status, promo_badge,
+                       notification_status, retry_count, last_notification_error,
                        last_checked_at, last_changed_at, created_at
-                FROM product_price_state
+                FROM b2b_price_monitor
                 WHERE entity_key = ?;
                 """,
                 (entity_key,),
             )
-            row = cursor.fetchone()
+            row = cur.fetchone()
             if row:
                 return row_to_product_price_state(row)
             return None
         finally:
-            cursor.close()
+            if own_cursor:
+                cur.close()
 
     def process_item(
         self,
@@ -136,6 +141,15 @@ class PriceMonitorPipeline:
         Returns (result_category, entity_key_or_quarantine_id).
         Categories: 'INSERTED', 'HEARTBEAT', 'STATE_CHANGE', 'QUARANTINED'.
         """
+        if not isinstance(raw_item, dict):
+            q = self.quarantine_payload(
+                "UNKNOWN_DOMAIN",
+                "UNKNOWN_URL",
+                str(raw_item),
+                "VALIDATION_ERROR: Payload must be a JSON object",
+            )
+            return "QUARANTINED", q.quarantine_id
+
         domain = raw_item.get("domain", "")
         raw_url = raw_item.get("canonical_url", "")
         raw_json = json.dumps(raw_item, default=str)
@@ -153,62 +167,33 @@ class PriceMonitorPipeline:
             return "QUARANTINED", q.quarantine_id
 
         entity_key = compute_entity_key(payload.domain, payload.sku)
-        existing = self.get_existing_state(entity_key)
-        diff = evaluate_diff(payload, existing)
-        now_dt = datetime.now(timezone.utc)
-        now_iso = now_dt.isoformat()
-
-        # Check circuit breaker for domain
         domain_blocked = payload.domain in trip_domains
+        notif_status = (
+            NotificationStatus.CIRCUIT_HALTED.value
+            if domain_blocked
+            else NotificationStatus.PENDING.value
+        )
+        notif_error = "HALTED_BY_CIRCUIT_BREAKER" if domain_blocked else None
 
+        # Check-and-write inside BEGIN IMMEDIATE to prevent TOCTOU races
         with transaction(self.conn) as cur:
+            existing = self.get_existing_state(entity_key, cursor=cur)
+            diff = evaluate_diff(payload, existing)
+            now_dt = datetime.now(timezone.utc)
+            now_iso = now_dt.isoformat()
+
             if diff.is_new:
                 # Case A: Brand-new product entity
-                cur.execute(
-                    """
-                    INSERT INTO product_price_state (
-                        entity_key, state_hash, domain, canonical_url, sku,
-                        product_title, currency_code, current_price_cents,
-                        current_price, previous_price, price_delta,
-                        price_delta_percent, price_change_pct, availability_status,
-                        last_checked_at, last_seen_at_utc, last_changed_at,
-                        updated_at_utc, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        diff.entity_key,
-                        diff.new_state_hash,
-                        payload.domain,
-                        payload.canonical_url,
-                        payload.sku,
-                        payload.product_title,
-                        payload.currency_code,
-                        diff.current_price_cents,
-                        str(diff.current_price),
-                        str(diff.previous_price) if diff.previous_price is not None else None,
-                        str(diff.price_delta) if diff.price_delta is not None else None,
-                        str(diff.price_delta_percent) if diff.price_delta_percent is not None else None,
-                        str(diff.price_delta_percent) if diff.price_delta_percent is not None else None,
-                        payload.availability_status.value,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                    ),
-                )
-
-                # Contract-aligned physical table b2b_price_monitor
                 cur.execute(
                     """
                     INSERT INTO b2b_price_monitor (
                         entity_key, state_hash, domain, canonical_url, sku,
                         product_title, currency_code, current_price_cents,
                         current_price, previous_price, price_delta,
-                        price_delta_percent, availability_status, notification_status,
-                        retry_count, last_notification_error, last_checked_at,
-                        last_changed_at, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        price_delta_percent, availability_status, promo_badge,
+                        notification_status, retry_count, last_notification_error,
+                        last_checked_at, last_changed_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         diff.entity_key,
@@ -224,9 +209,10 @@ class PriceMonitorPipeline:
                         str(diff.price_delta) if diff.price_delta is not None else None,
                         str(diff.price_delta_percent) if diff.price_delta_percent is not None else None,
                         payload.availability_status.value,
-                        NotificationStatus.PENDING.value if not domain_blocked else NotificationStatus.FAILED.value,
+                        payload.promo_badge,
+                        notif_status,
                         0,
-                        None if not domain_blocked else "HALTED_BY_CIRCUIT_BREAKER",
+                        notif_error,
                         now_iso,
                         now_iso,
                         now_iso,
@@ -245,6 +231,7 @@ class PriceMonitorPipeline:
                         "current_price": str(diff.current_price),
                         "currency": payload.currency_code,
                         "availability": payload.availability_status.value,
+                        "promo_badge": payload.promo_badge,
                     }
                 )
                 cur.execute(
@@ -260,9 +247,9 @@ class PriceMonitorPipeline:
                         diff.entity_key,
                         OutboxEventType.INITIAL_CAPTURE.value,
                         outbox_payload,
-                        NotificationStatus.PENDING.value if not domain_blocked else NotificationStatus.FAILED.value,
+                        notif_status,
                         0,
-                        None if not domain_blocked else "HALTED_BY_CIRCUIT_BREAKER",
+                        notif_error,
                         now_iso,
                         now_iso,
                     ),
@@ -271,15 +258,6 @@ class PriceMonitorPipeline:
 
             elif not diff.state_changed:
                 # Case B: Unchanged state signature -> UPDATE Heartbeat ONLY. Zero outbox events!
-                cur.execute(
-                    """
-                    UPDATE product_price_state
-                    SET last_checked_at = ?,
-                        last_seen_at_utc = ?
-                    WHERE entity_key = ?;
-                    """,
-                    (now_iso, now_iso, diff.entity_key),
-                )
                 cur.execute(
                     """
                     UPDATE b2b_price_monitor
@@ -294,52 +272,16 @@ class PriceMonitorPipeline:
                 # Case C: Business state changed -> Mutate state and emit outbox event atomically
                 cur.execute(
                     """
-                    UPDATE product_price_state
-                    SET state_hash = ?,
-                        previous_price = ?,
-                        current_price = ?,
-                        current_price_cents = ?,
-                        price_delta = ?,
-                        price_delta_percent = ?,
-                        price_change_pct = ?,
-                        availability_status = ?,
-                        product_title = ?,
-                        canonical_url = ?,
-                        last_changed_at = ?,
-                        updated_at_utc = ?,
-                        last_checked_at = ?,
-                        last_seen_at_utc = ?
-                    WHERE entity_key = ?;
-                    """,
-                    (
-                        diff.new_state_hash,
-                        str(diff.previous_price),
-                        str(diff.current_price),
-                        diff.current_price_cents,
-                        str(diff.price_delta),
-                        str(diff.price_delta_percent),
-                        str(diff.price_delta_percent),
-                        payload.availability_status.value,
-                        payload.product_title,
-                        payload.canonical_url,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                        now_iso,
-                        diff.entity_key,
-                    ),
-                )
-
-                cur.execute(
-                    """
                     UPDATE b2b_price_monitor
                     SET state_hash = ?,
+                        currency_code = ?,
                         previous_price = ?,
                         current_price = ?,
                         current_price_cents = ?,
                         price_delta = ?,
                         price_delta_percent = ?,
                         availability_status = ?,
+                        promo_badge = ?,
                         product_title = ?,
                         canonical_url = ?,
                         notification_status = ?,
@@ -351,16 +293,18 @@ class PriceMonitorPipeline:
                     """,
                     (
                         diff.new_state_hash,
-                        str(diff.previous_price),
+                        payload.currency_code,
+                        str(diff.previous_price) if diff.previous_price is not None else None,
                         str(diff.current_price),
                         diff.current_price_cents,
-                        str(diff.price_delta),
-                        str(diff.price_delta_percent),
+                        str(diff.price_delta) if diff.price_delta is not None else None,
+                        str(diff.price_delta_percent) if diff.price_delta_percent is not None else None,
                         payload.availability_status.value,
+                        payload.promo_badge,
                         payload.product_title,
                         payload.canonical_url,
-                        NotificationStatus.PENDING.value if not domain_blocked else NotificationStatus.FAILED.value,
-                        None if not domain_blocked else "HALTED_BY_CIRCUIT_BREAKER",
+                        notif_status,
+                        notif_error,
                         now_iso,
                         now_iso,
                         diff.entity_key,
@@ -376,12 +320,13 @@ class PriceMonitorPipeline:
                         "domain": payload.domain,
                         "canonical_url": payload.canonical_url,
                         "product_title": payload.product_title,
-                        "previous_price": str(diff.previous_price),
+                        "previous_price": str(diff.previous_price) if diff.previous_price is not None else None,
                         "current_price": str(diff.current_price),
-                        "price_delta": str(diff.price_delta),
-                        "price_delta_percent": str(diff.price_delta_percent),
+                        "price_delta": str(diff.price_delta) if diff.price_delta is not None else None,
+                        "price_delta_percent": str(diff.price_delta_percent) if diff.price_delta_percent is not None else None,
                         "currency": payload.currency_code,
                         "availability": payload.availability_status.value,
+                        "promo_badge": payload.promo_badge,
                     }
                 )
                 cur.execute(
@@ -397,14 +342,26 @@ class PriceMonitorPipeline:
                         diff.entity_key,
                         event_type_str,
                         outbox_payload,
-                        NotificationStatus.PENDING.value if not domain_blocked else NotificationStatus.FAILED.value,
+                        notif_status,
                         0,
-                        None if not domain_blocked else "HALTED_BY_CIRCUIT_BREAKER",
+                        notif_error,
                         now_iso,
                         now_iso,
                     ),
                 )
                 return "STATE_CHANGE", diff.entity_key
+
+    def _emit_admin_alert(self, alert_payload: dict[str, Any]) -> None:
+        """Send administrative TEMPLATE_DRIFT_DETECTED alert via configured callback."""
+        if self.admin_notifier is None:
+            return
+        try:
+            if hasattr(self.admin_notifier, "send_admin_alert"):
+                self.admin_notifier.send_admin_alert(alert_payload)
+            elif callable(self.admin_notifier):
+                self.admin_notifier(alert_payload)
+        except Exception as exc:
+            logger.error("Failed to dispatch admin alert for domain %s: %s", alert_payload.get("domain"), exc)
 
     def ingest_batch(self, batch: list[dict[str, Any]]) -> IngestionSummary:
         """Process a batch of scraped entities with Circuit Breaker detection."""
@@ -432,15 +389,36 @@ class PriceMonitorPipeline:
                 and (fail_count / total) > self.cb_config.max_quarantine_rate
             ):
                 tripped_domains.add(dom)
+                failure_rate = fail_count / total
                 logger.warning(
                     "CIRCUIT_BREAKER_TRIPPED: Domain %s failure rate %.2f (%d/%d, min_sample=%d) exceeds %.2f threshold. "
                     "Halt customer-facing notifications (TEMPLATE_DRIFT_DETECTED).",
                     dom,
-                    fail_count / total,
+                    failure_rate,
                     fail_count,
                     total,
                     self.cb_config.min_sample_size,
                     self.cb_config.max_quarantine_rate,
+                )
+                self._emit_admin_alert(
+                    {
+                        "event_type": "TEMPLATE_DRIFT_DETECTED",
+                        "alert_type": "TEMPLATE_DRIFT_DETECTED",
+                        "severity": "CRITICAL",
+                        "domain": dom,
+                        "failure_count": fail_count,
+                        "total_count": total,
+                        "failure_rate": round(failure_rate, 4),
+                        "threshold": self.cb_config.max_quarantine_rate,
+                        "min_sample_size": self.cb_config.min_sample_size,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "message": (
+                            f"TEMPLATE_DRIFT_DETECTED on domain {dom}: "
+                            f"{fail_count}/{total} ({failure_rate:.1%}) failed validation "
+                            f"(threshold={self.cb_config.max_quarantine_rate:.1%}). "
+                            "Customer-facing alerts halted."
+                        ),
+                    }
                 )
 
         summary.tripped_circuit_breakers = list(tripped_domains)

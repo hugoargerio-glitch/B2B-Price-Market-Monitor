@@ -5,13 +5,23 @@ Manages notification dispatch with strict state transitions:
 """
 
 from datetime import datetime, timedelta, timezone
-import json
 import random
+import re
 import sqlite3
 from typing import Callable, Optional
 
 from src.models import NotificationStatus, PriceChangeOutbox
 from src.storage import transaction
+
+
+def _sanitize_error_message(error_message: str) -> str:
+    """Scrub webhook tokens from error strings before persisting."""
+    scrubbed = re.sub(
+        r"(https?://(?:discord\.com/api/webhooks|hooks\.slack\.com/services)/[^\s]+)",
+        lambda m: m.group(1).rsplit("/", 1)[0] + "/***",
+        error_message,
+    )
+    return scrubbed[:512]
 
 
 def calculate_backoff_seconds(
@@ -48,10 +58,11 @@ class OutboxDispatcher:
     def fetch_pending_events(
         self,
         limit: int = 50,
-        enforce_backoff: bool = False,
+        enforce_backoff: bool = True,
         now_utc: Optional[datetime] = None,
+        with_jitter: bool = False,
     ) -> list[PriceChangeOutbox]:
-        """Fetch outbox records that require dispatch (PENDING or FAILED with retry_count < max_retries)."""
+        """Fetch outbox records eligible for dispatch, excluding CIRCUIT_HALTED rows."""
         cursor = self.conn.cursor()
         try:
             cursor.execute(
@@ -61,11 +72,12 @@ class OutboxDispatcher:
                        created_at, updated_at
                 FROM price_change_outbox
                 WHERE notification_status IN ('PENDING', 'FAILED')
+                  AND notification_status != 'CIRCUIT_HALTED'
+                  AND COALESCE(last_notification_error, '') != 'HALTED_BY_CIRCUIT_BREAKER'
                   AND retry_count < ?
-                ORDER BY created_at ASC
-                LIMIT ?;
+                ORDER BY created_at ASC;
                 """,
-                (self.max_retries, limit),
+                (self.max_retries,),
             )
             rows = cursor.fetchall()
             events = [
@@ -83,7 +95,7 @@ class OutboxDispatcher:
                 for row in rows
             ]
             if not enforce_backoff:
-                return events
+                return events[:limit]
 
             ref_now = now_utc or datetime.now(timezone.utc)
             ready_events: list[PriceChangeOutbox] = []
@@ -95,11 +107,13 @@ class OutboxDispatcher:
                         ev.retry_count,
                         base_seconds=self.base_backoff_seconds,
                         max_seconds=self.max_backoff_seconds,
-                        with_jitter=False,
+                        with_jitter=with_jitter,
                     )
                     updated_dt = ev.updated_at if ev.updated_at.tzinfo else ev.updated_at.replace(tzinfo=timezone.utc)
                     if ref_now >= updated_dt + timedelta(seconds=wait_sec):
                         ready_events.append(ev)
+                if len(ready_events) >= limit:
+                    break
             return ready_events
         finally:
             cursor.close()
@@ -145,7 +159,7 @@ class OutboxDispatcher:
                 else NotificationStatus.FAILED
             )
 
-            truncated_err = error_message[:512]
+            truncated_err = _sanitize_error_message(error_message)
 
             cur.execute(
                 """
@@ -174,10 +188,19 @@ class OutboxDispatcher:
         self,
         sender: Callable[[PriceChangeOutbox], bool],
         limit: int = 50,
+        enforce_backoff: bool = True,
+        now_utc: Optional[datetime] = None,
+        with_jitter: bool = True,
     ) -> dict[str, int]:
         """Dispatch a batch of pending events using the provided sender callable."""
-        events = self.fetch_pending_events(limit=limit)
+        events = self.fetch_pending_events(
+            limit=limit,
+            enforce_backoff=enforce_backoff,
+            now_utc=now_utc,
+            with_jitter=with_jitter,
+        )
         stats = {"dispatched": 0, "failed": 0, "dead_letter": 0}
+        bound_self = getattr(sender, "__self__", None)
 
         for ev in events:
             try:
@@ -186,7 +209,8 @@ class OutboxDispatcher:
                     self.mark_dispatched(ev.outbox_id, ev.entity_key)
                     stats["dispatched"] += 1
                 else:
-                    status = self.mark_failed(ev.outbox_id, ev.entity_key, "Sender returned failure status")
+                    err_msg = getattr(bound_self, "last_error", None) or "Sender returned failure status"
+                    status = self.mark_failed(ev.outbox_id, ev.entity_key, err_msg)
                     if status == NotificationStatus.DEAD_LETTER:
                         stats["dead_letter"] += 1
                     else:

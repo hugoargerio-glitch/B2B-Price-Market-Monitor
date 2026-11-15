@@ -1,6 +1,7 @@
 """
 Integration tests for CLI entrypoint in src/main.py.
-Verifies CLI subcommands: simulate, status, dispatch (--dry-run), ingest, and run.
+Verifies CLI subcommands: simulate, status, dispatch (--dry-run), ingest, and run,
+plus B2B_DB_PATH env resolution and non-blocking cmd_status execution.
 """
 
 from decimal import Decimal
@@ -64,6 +65,34 @@ def test_cli_status(cli_db_path, capsys):
     assert "B2B PRICE & MARKET MONITOR — EXECUTIVE DASHBOARD" in captured.out
     assert "Active Tracked SKUs" in captured.out
     assert "TRANSACTIONAL OUTBOX QUEUE" in captured.out
+
+
+def test_cli_status_non_blocking_uninitialized(tmp_path, capsys):
+    """AUD-008: cmd_status must exit cleanly without creating DB file or acquiring write locks."""
+    non_existent = tmp_path / "never_created.db"
+    assert not non_existent.exists()
+
+    exit_code = main(["--db-path", str(non_existent), "status"])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    assert "does not exist yet" in captured.out
+    # DB file should still not exist!
+    assert not non_existent.exists()
+
+
+def test_cli_b2b_db_path_env_var(cli_db_path, monkeypatch, capsys):
+    """AUD-002: CLI defaults --db-path dynamically from B2B_DB_PATH when omitted."""
+    # Seed data
+    main(["--db-path", str(cli_db_path), "simulate", "--items", "2"])
+
+    monkeypatch.setenv("B2B_DB_PATH", str(cli_db_path))
+    exit_code = main(["status"])
+    assert exit_code == 0
+
+    captured = capsys.readouterr()
+    assert "B2B PRICE & MARKET MONITOR — EXECUTIVE DASHBOARD" in captured.out
+    assert "Active Tracked SKUs" in captured.out
 
 
 def test_cli_dispatch_dry_run(cli_db_path, capsys):

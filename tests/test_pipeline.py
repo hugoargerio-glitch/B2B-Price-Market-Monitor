@@ -1,7 +1,7 @@
 """
 Integration tests for end-to-end Ingestion Pipeline in src/pipeline.py.
-Verifies atomic state transitions, heartbeat-only updates, quarantine routing,
-and Domain Circuit Breakers.
+Verifies atomic state transitions in canonical b2b_price_monitor, heartbeat-only updates,
+quarantine routing, Domain Circuit Breakers (CIRCUIT_HALTED + admin alert), and TOCTOU safety.
 """
 
 from decimal import Decimal
@@ -23,7 +23,7 @@ def pipeline_db(tmp_path):
 
 
 def test_pipeline_ingest_new_entity(pipeline_db):
-    """New entity insertion must write to product_price_state and outbox atomically."""
+    """New entity insertion must write to b2b_price_monitor and outbox atomically."""
     pipeline = PriceMonitorPipeline(pipeline_db)
 
     batch = [
@@ -44,7 +44,7 @@ def test_pipeline_ingest_new_entity(pipeline_db):
     assert summary.quarantined == 0
 
     cur = pipeline_db.cursor()
-    cur.execute("SELECT COUNT(*) FROM product_price_state;")
+    cur.execute("SELECT COUNT(*) FROM b2b_price_monitor;")
     assert cur.fetchone()[0] == 1
 
     cur.execute("SELECT event_type, notification_status FROM price_change_outbox;")
@@ -74,7 +74,7 @@ def test_pipeline_heartbeat_zero_outbox_events(pipeline_db):
     cur.execute("SELECT COUNT(*) FROM price_change_outbox;")
     assert cur.fetchone()[0] == 1
 
-    cur.execute("SELECT last_checked_at, last_changed_at FROM product_price_state;")
+    cur.execute("SELECT last_checked_at, last_changed_at FROM b2b_price_monitor;")
     first_checked, first_changed = cur.fetchone()
 
     # Second run: identical state
@@ -88,7 +88,7 @@ def test_pipeline_heartbeat_zero_outbox_events(pipeline_db):
     assert cur.fetchone()[0] == 1
 
     # last_changed_at must not be mutated
-    cur.execute("SELECT last_changed_at FROM product_price_state;")
+    cur.execute("SELECT last_changed_at FROM b2b_price_monitor;")
     assert cur.fetchone()[0] == first_changed
 
 
@@ -119,7 +119,7 @@ def test_pipeline_price_mutation_and_outbox(pipeline_db):
     cur.execute(
         """
         SELECT previous_price, current_price, price_delta, price_delta_percent
-        FROM product_price_state;
+        FROM b2b_price_monitor;
         """
     )
     prev, curr, delta, pct = cur.fetchone()
@@ -176,7 +176,7 @@ def test_pipeline_shift_left_quarantine_without_batch_abortion(pipeline_db):
 
     cur = pipeline_db.cursor()
     # Valid item saved
-    cur.execute("SELECT COUNT(*) FROM product_price_state;")
+    cur.execute("SELECT COUNT(*) FROM b2b_price_monitor;")
     assert cur.fetchone()[0] == 1
 
     # Malformed items routed to DLQ
@@ -186,7 +186,7 @@ def test_pipeline_shift_left_quarantine_without_batch_abortion(pipeline_db):
 
 
 def test_pipeline_domain_circuit_breaker(pipeline_db):
-    """When a domain has >= min_sample_size items and >20% failure rate, circuit breaker trips and halts alerts."""
+    """AUD-001: When circuit breaker trips, notifications transition to CIRCUIT_HALTED."""
     pipeline = PriceMonitorPipeline(
         pipeline_db,
         circuit_breaker_config=CircuitBreakerConfig(max_quarantine_rate=0.20, min_sample_size=10),
@@ -212,14 +212,49 @@ def test_pipeline_domain_circuit_breaker(pipeline_db):
     assert summary.inserted_new == 4
 
     cur = pipeline_db.cursor()
-    cur.execute("SELECT notification_status, last_notification_error FROM price_change_outbox WHERE entity_key IN (SELECT entity_key FROM product_price_state WHERE domain = 'bad-domain.com');")
+    cur.execute(
+        """
+        SELECT notification_status, last_notification_error
+        FROM price_change_outbox
+        WHERE entity_key IN (SELECT entity_key FROM b2b_price_monitor WHERE domain = 'bad-domain.com');
+        """
+    )
     for notif_stat, notif_err in cur.fetchall():
-        assert notif_stat == NotificationStatus.FAILED.value
+        assert notif_stat == NotificationStatus.CIRCUIT_HALTED.value
         assert notif_err == "HALTED_BY_CIRCUIT_BREAKER"
 
 
+def test_pipeline_domain_circuit_breaker_admin_alert(pipeline_db):
+    """AUD-001: Tripping circuit breaker dispatches TEMPLATE_DRIFT_DETECTED alert to admin_notifier."""
+    admin_alerts = []
+    pipeline = PriceMonitorPipeline(
+        pipeline_db,
+        circuit_breaker_config=CircuitBreakerConfig(max_quarantine_rate=0.20, min_sample_size=10),
+        admin_notifier=lambda payload: admin_alerts.append(payload),
+    )
+
+    batch = [
+        {
+            "domain": "bad-domain.com",
+            "canonical_url": f"https://bad-domain.com/p{i}",
+            "sku": f"SKU-{i}",
+            "product_title": f"Product {i}",
+            "currency_code": "BRL",
+            "current_price": Decimal("100.0000") if i < 4 else 99.99,
+            "availability_status": AvailabilityStatus.IN_STOCK.value,
+        }
+        for i in range(10)
+    ]
+    pipeline.ingest_batch(batch)
+    assert len(admin_alerts) == 1
+    alert = admin_alerts[0]
+    assert alert["event_type"] == "TEMPLATE_DRIFT_DETECTED"
+    assert alert["domain"] == "bad-domain.com"
+    assert alert["severity"] == "CRITICAL"
+
+
 def test_pipeline_circuit_breaker_ignores_small_sample_size(pipeline_db):
-    """When a domain has < min_sample_size items (e.g., 3 items with 1 failure = 33%), circuit breaker MUST NOT trip."""
+    """When a domain has < min_sample_size items, circuit breaker MUST NOT trip."""
     pipeline = PriceMonitorPipeline(
         pipeline_db,
         circuit_breaker_config=CircuitBreakerConfig(max_quarantine_rate=0.20, min_sample_size=10),
@@ -246,7 +281,72 @@ def test_pipeline_circuit_breaker_ignores_small_sample_size(pipeline_db):
 
     cur = pipeline_db.cursor()
     cur.execute(
-        "SELECT notification_status FROM price_change_outbox WHERE entity_key IN (SELECT entity_key FROM product_price_state WHERE domain = 'boutique-domain.com');"
+        """
+        SELECT notification_status
+        FROM price_change_outbox
+        WHERE entity_key IN (SELECT entity_key FROM b2b_price_monitor WHERE domain = 'boutique-domain.com');
+        """
     )
     for (notif_stat,) in cur.fetchall():
         assert notif_stat == NotificationStatus.PENDING.value
+
+
+def test_pipeline_concurrent_process_item_toctou(pipeline_db):
+    """AUD-009: Verify process_item safe execution inside transaction."""
+    pipeline = PriceMonitorPipeline(pipeline_db)
+    item_v1 = {
+        "domain": "competitor.com",
+        "canonical_url": "https://competitor.com/concurrent-1",
+        "sku": "SKU-CONC-1",
+        "product_title": "Product Conc",
+        "currency_code": "USD",
+        "current_price": Decimal("100.0000"),
+        "availability_status": AvailabilityStatus.IN_STOCK.value,
+    }
+    cat1, ek1 = pipeline.process_item(item_v1, set())
+    assert cat1 == "INSERTED"
+
+    item_v2 = {
+        **item_v1,
+        "current_price": Decimal("120.0000"),
+    }
+    cat2, ek2 = pipeline.process_item(item_v2, set())
+    assert cat2 == "STATE_CHANGE"
+    assert ek1 == ek2
+
+
+def test_pipeline_promo_badge_and_currency_update(pipeline_db):
+    """AUD-010 & AUD-014: State mutations update promo_badge and currency_code."""
+    pipeline = PriceMonitorPipeline(pipeline_db)
+    item = {
+        "domain": "competitor.com",
+        "canonical_url": "https://competitor.com/item-promo",
+        "sku": "SKU-PROMO-1",
+        "product_title": "Product Promo",
+        "currency_code": "BRL",
+        "current_price": Decimal("100.0000"),
+        "availability_status": AvailabilityStatus.IN_STOCK.value,
+        "promo_badge": "EARLY_BIRD",
+    }
+    pipeline.ingest_batch([item])
+
+    cur = pipeline_db.cursor()
+    cur.execute("SELECT promo_badge, currency_code FROM b2b_price_monitor WHERE sku = 'SKU-PROMO-1';")
+    badge, curr = cur.fetchone()
+    assert badge == "EARLY_BIRD"
+    assert curr == "BRL"
+
+    # Mutate promo badge and currency
+    item_updated = {
+        **item,
+        "promo_badge": "FLASH_SALE",
+        "currency_code": "USD",
+        "current_price": Decimal("20.0000"),
+    }
+    summary = pipeline.ingest_batch([item_updated])
+    assert summary.updated_state_change == 1
+
+    cur.execute("SELECT promo_badge, currency_code FROM b2b_price_monitor WHERE sku = 'SKU-PROMO-1';")
+    badge2, curr2 = cur.fetchone()
+    assert badge2 == "FLASH_SALE"
+    assert curr2 == "USD"

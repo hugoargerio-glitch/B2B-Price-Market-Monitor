@@ -25,6 +25,7 @@ class NotificationStatus(str, Enum):
     DISPATCHED = "DISPATCHED"
     FAILED = "FAILED"
     DEAD_LETTER = "DEAD_LETTER"
+    CIRCUIT_HALTED = "CIRCUIT_HALTED"
 
 
 class QuarantineResolutionStatus(str, Enum):
@@ -37,6 +38,7 @@ class OutboxEventType(str, Enum):
     INITIAL_CAPTURE = "INITIAL_CAPTURE"
     PRICE_CHANGED = "PRICE_CHANGED"
     AVAILABILITY_CHANGED = "AVAILABILITY_CHANGED"
+    PROMO_CHANGED = "PROMO_CHANGED"
 
 
 def to_decimal_18_4(val: Any, allow_negative: bool = False) -> Decimal:
@@ -48,7 +50,8 @@ def to_decimal_18_4(val: Any, allow_negative: bool = False) -> Decimal:
         )
     if not isinstance(val, Decimal):
         try:
-            val = Decimal(str(val))
+            raw = val.strip() if isinstance(val, str) else str(val)
+            val = Decimal(raw)
         except Exception as e:
             raise ValueError(f"Cannot convert {val!r} to Decimal: {e}") from e
 
@@ -114,6 +117,7 @@ class ProductPriceState(BaseModel):
     price_delta: Decimal | None = Field(default=None)
     price_delta_percent: Decimal | None = Field(default=None)
     availability_status: AvailabilityStatus = Field(...)
+    promo_badge: str | None = Field(default=None, max_length=128)
     notification_status: NotificationStatus = Field(default=NotificationStatus.PENDING)
     retry_count: int = Field(default=0, ge=0, le=5)
     last_notification_error: str | None = Field(default=None, max_length=512)

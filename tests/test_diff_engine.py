@@ -1,6 +1,7 @@
 """
 Unit tests for Dual-Hash Diff Engine in src/diff_engine.py.
-Verifies entity_key determinism, state_hash transient exclusion, and delta calculations.
+Verifies entity_key determinism, state_hash transient exclusion, delta calculations,
+and diff classification (PRICE_CHANGED, AVAILABILITY_CHANGED, PROMO_CHANGED).
 """
 
 from decimal import Decimal
@@ -67,6 +68,7 @@ def test_evaluate_diff_new_entity():
         currency_code="BRL",
         current_price=Decimal("199.9000"),
         availability_status=AvailabilityStatus.IN_STOCK,
+        promo_badge=None,
     )
     diff = evaluate_diff(payload, existing=None)
     assert diff.is_new is True
@@ -86,6 +88,7 @@ def test_evaluate_diff_heartbeat_zero_change():
         currency_code="BRL",
         current_price=Decimal("199.9000"),
         availability_status=AvailabilityStatus.IN_STOCK,
+        promo_badge=None,
     )
     ek = compute_entity_key(payload.domain, payload.sku)
     sh = compute_state_hash(payload.current_price_cents, payload.currency_code, payload.availability_status)
@@ -101,6 +104,7 @@ def test_evaluate_diff_heartbeat_zero_change():
         current_price=payload.current_price,
         current_price_cents=payload.current_price_cents,
         availability_status=payload.availability_status,
+        promo_badge=None,
     )
 
     diff = evaluate_diff(payload, existing=existing)
@@ -143,3 +147,103 @@ def test_evaluate_diff_price_mutation():
     assert diff.previous_price == Decimal("199.9000")
     assert diff.current_price == Decimal("179.9000")
     assert diff.price_delta == Decimal("-20.0000")
+
+
+def test_evaluate_diff_currency_mutation():
+    """AUD-010: Currency code mutation must be classified as PRICE_CHANGED."""
+    payload = ScrapePayload(
+        domain="competitor.com",
+        canonical_url="https://competitor.com/item1",
+        sku="SKU-1",
+        product_title="Item 1",
+        currency_code="USD",  # Changed from BRL
+        current_price=Decimal("199.9000"),
+        availability_status=AvailabilityStatus.IN_STOCK,
+    )
+    ek = compute_entity_key(payload.domain, payload.sku)
+    old_sh = compute_state_hash(19990, "BRL", AvailabilityStatus.IN_STOCK)
+
+    existing = ProductPriceState(
+        entity_key=ek,
+        state_hash=old_sh,
+        domain=payload.domain,
+        canonical_url=payload.canonical_url,
+        sku=payload.sku,
+        product_title=payload.product_title,
+        currency_code="BRL",
+        current_price=Decimal("199.9000"),
+        current_price_cents=19990,
+        availability_status=AvailabilityStatus.IN_STOCK,
+    )
+
+    diff = evaluate_diff(payload, existing=existing)
+    assert diff.state_changed is True
+    assert diff.event_type == OutboxEventType.PRICE_CHANGED
+
+
+def test_evaluate_diff_promo_mutation():
+    """AUD-014: Promo badge addition/change must be classified as PROMO_CHANGED."""
+    payload = ScrapePayload(
+        domain="competitor.com",
+        canonical_url="https://competitor.com/item1",
+        sku="SKU-1",
+        product_title="Item 1",
+        currency_code="BRL",
+        current_price=Decimal("199.9000"),
+        availability_status=AvailabilityStatus.IN_STOCK,
+        promo_badge="BLACK_FRIDAY",  # Added promo badge
+    )
+    ek = compute_entity_key(payload.domain, payload.sku)
+    old_sh = compute_state_hash(19990, "BRL", AvailabilityStatus.IN_STOCK, promo_badge=None)
+
+    existing = ProductPriceState(
+        entity_key=ek,
+        state_hash=old_sh,
+        domain=payload.domain,
+        canonical_url=payload.canonical_url,
+        sku=payload.sku,
+        product_title=payload.product_title,
+        currency_code="BRL",
+        current_price=Decimal("199.9000"),
+        current_price_cents=19990,
+        availability_status=AvailabilityStatus.IN_STOCK,
+        promo_badge=None,
+    )
+
+    diff = evaluate_diff(payload, existing=existing)
+    assert diff.state_changed is True
+    assert diff.event_type == OutboxEventType.PROMO_CHANGED
+
+
+def test_evaluate_diff_availability_mutation():
+    """Availability mutation must be classified as AVAILABILITY_CHANGED."""
+    payload = ScrapePayload(
+        domain="competitor.com",
+        canonical_url="https://competitor.com/item1",
+        sku="SKU-1",
+        product_title="Item 1",
+        currency_code="BRL",
+        current_price=Decimal("199.9000"),
+        availability_status=AvailabilityStatus.OUT_OF_STOCK,  # Changed
+        promo_badge=None,
+    )
+    ek = compute_entity_key(payload.domain, payload.sku)
+    old_sh = compute_state_hash(19990, "BRL", AvailabilityStatus.IN_STOCK)
+
+    existing = ProductPriceState(
+        entity_key=ek,
+        state_hash=old_sh,
+        domain=payload.domain,
+        canonical_url=payload.canonical_url,
+        sku=payload.sku,
+        product_title=payload.product_title,
+        currency_code="BRL",
+        current_price=Decimal("199.9000"),
+        current_price_cents=19990,
+        availability_status=AvailabilityStatus.IN_STOCK,
+        promo_badge=None,
+    )
+
+    diff = evaluate_diff(payload, existing=existing)
+    assert diff.state_changed is True
+    assert diff.event_type == OutboxEventType.AVAILABILITY_CHANGED
