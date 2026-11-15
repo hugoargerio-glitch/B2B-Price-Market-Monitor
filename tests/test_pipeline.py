@@ -350,3 +350,68 @@ def test_pipeline_promo_badge_and_currency_update(pipeline_db):
     badge2, curr2 = cur.fetchone()
     assert badge2 == "FLASH_SALE"
     assert curr2 == "USD"
+
+
+def test_pipeline_non_dict_items_quarantined_cleanly(pipeline_db):
+    """AUD-017: ingest_batch with non-dict items routes to DLQ without raising AttributeError."""
+    pipeline = PriceMonitorPipeline(pipeline_db)
+
+    corrupted_batch = ["corrupted_string", None, 123, ["nested_list"]]
+    summary = pipeline.ingest_batch(corrupted_batch)
+
+    assert summary.total_received == 4
+    assert summary.quarantined == 4
+    assert summary.inserted_new == 0
+
+    cur = pipeline_db.cursor()
+    cur.execute("SELECT COUNT(*) FROM b2b_price_monitor;")
+    assert cur.fetchone()[0] == 0
+
+    cur.execute("SELECT COUNT(*), failure_reason, resolution_status FROM b2b_price_monitor_quarantine GROUP BY failure_reason, resolution_status;")
+    rows = cur.fetchall()
+    total_quarantined = sum(r[0] for r in rows)
+    assert total_quarantined == 4
+    for r in rows:
+        assert r[2] == "UNRESOLVED"
+
+
+def test_pipeline_mixed_batch_with_non_dict_and_valid(pipeline_db):
+    """AUD-017: Batch containing both valid items and non-dict malformed items succeeds for valid items."""
+    pipeline = PriceMonitorPipeline(pipeline_db)
+
+    batch = [
+        {
+            "domain": "valid-store.com",
+            "canonical_url": "https://valid-store.com/item-1",
+            "sku": "SKU-VALID-01",
+            "product_title": "Valid Item 1",
+            "currency_code": "USD",
+            "current_price": Decimal("99.9900"),
+            "availability_status": AvailabilityStatus.IN_STOCK.value,
+        },
+        "not_a_dictionary_payload",
+        None,
+        99999,
+        {
+            "domain": "valid-store.com",
+            "canonical_url": "https://valid-store.com/item-2",
+            "sku": "SKU-VALID-02",
+            "product_title": "Valid Item 2",
+            "currency_code": "USD",
+            "current_price": Decimal("149.0000"),
+            "availability_status": AvailabilityStatus.IN_STOCK.value,
+        },
+    ]
+
+    summary = pipeline.ingest_batch(batch)
+    assert summary.total_received == 5
+    assert summary.inserted_new == 2
+    assert summary.quarantined == 3
+
+    cur = pipeline_db.cursor()
+    cur.execute("SELECT COUNT(*) FROM b2b_price_monitor;")
+    assert cur.fetchone()[0] == 2
+
+    cur.execute("SELECT COUNT(*) FROM b2b_price_monitor_quarantine;")
+    assert cur.fetchone()[0] == 3
+

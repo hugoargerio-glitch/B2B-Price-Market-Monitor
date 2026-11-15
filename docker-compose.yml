@@ -6,6 +6,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: runtime
     image: b2b-price-monitor:latest
     container_name: b2b-price-monitor
     environment:
@@ -20,7 +21,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: b2b-price-monitor:latest
+      target: test
+    image: b2b-price-monitor:test
     container_name: b2b-price-monitor-test
     profiles: ["test"]
     entrypoint: ["pytest"]

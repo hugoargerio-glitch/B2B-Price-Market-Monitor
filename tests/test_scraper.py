@@ -157,3 +157,112 @@ def test_http_scraper_scrape_json():
         assert payload["sku"] == "SKU-42"
         assert payload["current_price"] == Decimal("89.5000")
         assert payload["domain"] == "test-competitor.com"
+
+
+@pytest.mark.parametrize(
+    "forbidden_url",
+    [
+        "file:///etc/passwd",
+        "file:///tmp/secrets.txt",
+        "ftp://internal.mirror/repo",
+        "gopher://evil.host:70/",
+    ],
+)
+def test_http_scraper_ssrf_blocking_forbidden_schemes(forbidden_url):
+    """AUD-015: Non-HTTP(S) schemes are blocked immediately with ValueError."""
+    scraper = HttpScraper()
+    with pytest.raises(ValueError) as excinfo:
+        scraper.fetch_url(forbidden_url)
+    assert any(term in str(excinfo.value).lower() for term in ["scheme", "http", "ssrf", "blocked", "protocol"])
+
+
+@pytest.mark.parametrize(
+    "private_url",
+    [
+        "http://127.0.0.1/admin",
+        "http://127.0.0.2:8000/api",
+        "http://localhost:8080/metrics",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/internal",
+        "http://172.16.0.5/api",
+        "http://192.168.1.1/router",
+        "http://[::1]/status",
+    ],
+)
+def test_http_scraper_ssrf_blocking_private_and_loopback_ips(private_url):
+    """AUD-015: Loopback, private, and cloud metadata IPs are rejected with ValueError."""
+    scraper = HttpScraper()
+    with pytest.raises(ValueError) as excinfo:
+        scraper.fetch_url(private_url)
+    assert any(term in str(excinfo.value).lower() for term in ["ssrf", "private", "loopback", "blocked", "address"])
+
+
+def test_http_scraper_oversized_response_protection():
+    """AUD-015: Response bodies exceeding MAX_RESPONSE_BYTES (10 MB) raise ValueError to prevent OOM."""
+    scraper = HttpScraper()
+    oversized_bytes = b"X" * (10 * 1024 * 1024 + 1024)  # > 10 MB
+
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = oversized_bytes
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        with pytest.raises(ValueError) as excinfo:
+            scraper.fetch_url("https://competitor.com/huge-catalog.json")
+        assert any(term in str(excinfo.value).lower() for term in ["size", "bytes", "limit", "max", "large", "oom"])
+
+
+def test_http_scraper_scrape_json_empty_array():
+    """AUD-016: scrape_json on empty array [] raises descriptive ValueError."""
+    scraper = HttpScraper()
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = b"[]"
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        with pytest.raises(ValueError) as excinfo:
+            scraper.scrape_json("https://competitor.com/api/empty")
+        assert any(term in str(excinfo.value).lower() for term in ["empty", "list", "array", "payload"])
+
+
+@pytest.mark.parametrize("non_dict_payload", [b'"just_a_string"', b"12345", b"true", b"null"])
+def test_http_scraper_scrape_json_non_dict_payload(non_dict_payload):
+    """AUD-016: scrape_json on non-dict JSON raises descriptive ValueError instead of AttributeError."""
+    scraper = HttpScraper()
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = non_dict_payload
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        with pytest.raises(ValueError) as excinfo:
+            scraper.scrape_json("https://competitor.com/api/invalid-format")
+        assert any(term in str(excinfo.value).lower() for term in ["dict", "object", "expected", "payload", "json"])
+
+
+def test_http_scraper_http_error_handling():
+    """AUD-016: HTTP 4xx/5xx errors are surfaced with diagnostic context."""
+    scraper = HttpScraper()
+    http_err = urllib.error.HTTPError(
+        url="https://competitor.com/api/product/404",
+        code=404,
+        msg="Not Found",
+        hdrs={},
+        fp=None,
+    )
+
+    with patch("urllib.request.urlopen", side_effect=http_err):
+        with pytest.raises((urllib.error.HTTPError, ValueError)) as excinfo:
+            scraper.fetch_url("https://competitor.com/api/product/404")
+        assert "404" in str(excinfo.value) or (hasattr(excinfo.value, "code") and excinfo.value.code == 404)
+
+
+def test_http_scraper_url_error_handling():
+    """AUD-016: Network connection failures (URLError) are caught and reported with diagnostic info."""
+    scraper = HttpScraper()
+    url_err = urllib.error.URLError("Temporary DNS failure")
+
+    with patch("urllib.request.urlopen", side_effect=url_err):
+        with pytest.raises((urllib.error.URLError, ValueError)) as excinfo:
+            scraper.fetch_url("https://unreachable-competitor.internal/feed")
+        assert "Temporary DNS failure" in str(excinfo.value) or (hasattr(excinfo.value, "reason") and "DNS" in str(excinfo.value.reason))
+

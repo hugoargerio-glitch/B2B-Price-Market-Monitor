@@ -229,27 +229,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("=" * 78 + "\n")
 
     return 0
-    print("  Storage Engine     : SQLite 3 (WAL Mode, synchronous=NORMAL)")
-    print("  Execution Profile  : Profile 1 (Lean App / CDC Engine)")
-    print("  Contract Spec      : ODCS v3.2.0 (competitor_intelligence)")
-    print("-" * 78)
-    print("  📊 MONITORED INVENTORY")
-    print(f"     • Active Tracked SKUs        : {total_skus}")
-    print(f"     • Competitor Domains         : {total_domains}")
-    print(f"     • State Drift Mutations      : {total_changes}")
-    print("-" * 78)
-    print("  📬 TRANSACTIONAL OUTBOX QUEUE")
-    print(f"     • Dispatched Alerts          : {dispatched}")
-    print(f"     • Pending Outbox Alerts      : {pending}")
-    print(f"     • Retrying Failures          : {failed}")
-    print(f"     • Dead-Letter (Max Retries)  : {dead_letter}")
-    print("-" * 78)
-    print("  🛡️ QUARANTINE DLQ (SHIFT-LEFT EDGE VALIDATION)")
-    print(f"     • Total Quarantined Events   : {total_quarantine}")
-    print(f"     • Unresolved Incidents       : {unresolved_quarantine}")
-    print("=" * 78 + "\n")
-
-    return 0
 
 
 def cmd_clean_outbox(args: argparse.Namespace) -> int:
@@ -299,21 +278,29 @@ def cmd_run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     """Construct command-line interface arguments."""
     default_db = get_default_db_path()
+
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument(
+        "--db-path",
+        type=str,
+        default=argparse.SUPPRESS,
+        help=f"Path to SQLite database (default: {default_db})",
+    )
+
     parser = argparse.ArgumentParser(
         prog="b2b-price-monitor",
         description="B2B Competitor Price & Market Monitor CLI (ODCS v3.2.0 Profile 1)",
-    )
-    parser.add_argument(
-        "--db-path",
-        type=str,
-        default=str(default_db),
-        help=f"Path to SQLite database (default: {default_db})",
+        parents=[parent_parser],
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
     # simulate
-    sub_sim = subparsers.add_parser("simulate", help="Generate simulated market drift and ingest batch")
+    sub_sim = subparsers.add_parser(
+        "simulate",
+        parents=[parent_parser],
+        help="Generate simulated market drift and ingest batch",
+    )
     sub_sim.add_argument("--items", "-n", type=int, default=5, help="Number of items to simulate (default: 5)")
     sub_sim.add_argument(
         "--include-quarantine",
@@ -323,11 +310,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # ingest
-    sub_ingest = subparsers.add_parser("ingest", help="Ingest external JSON payload file")
+    sub_ingest = subparsers.add_parser(
+        "ingest",
+        parents=[parent_parser],
+        help="Ingest external JSON payload file",
+    )
     sub_ingest.add_argument("--file", "-f", type=str, required=True, help="Path to JSON file")
 
     # dispatch
-    sub_dispatch = subparsers.add_parser("dispatch", help="Dispatch pending outbox notifications")
+    sub_dispatch = subparsers.add_parser(
+        "dispatch",
+        parents=[parent_parser],
+        help="Dispatch pending outbox notifications",
+    )
     sub_dispatch.add_argument("--limit", "-l", type=int, default=50, help="Max pending events to dispatch")
     sub_dispatch.add_argument(
         "--dry-run",
@@ -336,17 +331,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # status
-    subparsers.add_parser("status", help="Display executive status dashboard")
+    subparsers.add_parser(
+        "status",
+        parents=[parent_parser],
+        help="Display executive status dashboard",
+    )
 
     # clean-outbox
-    sub_clean = subparsers.add_parser("clean-outbox", help="Purge DISPATCHED outbox records older than N days")
+    sub_clean = subparsers.add_parser(
+        "clean-outbox",
+        parents=[parent_parser],
+        help="Purge DISPATCHED outbox records older than N days",
+    )
     sub_clean.add_argument("--days", "-d", type=int, default=30, help="Retention window in days (default: 30)")
 
     # vacuum
-    subparsers.add_parser("vacuum", help="Execute WAL checkpoint(TRUNCATE) and VACUUM on SQLite DB")
+    subparsers.add_parser(
+        "vacuum",
+        parents=[parent_parser],
+        help="Execute WAL checkpoint(TRUNCATE) and VACUUM on SQLite DB",
+    )
 
     # run
-    sub_run = subparsers.add_parser("run", help="Run end-to-end simulate -> dispatch -> status")
+    sub_run = subparsers.add_parser(
+        "run",
+        parents=[parent_parser],
+        help="Run end-to-end simulate -> dispatch -> status",
+    )
     sub_run.add_argument("--items", "-n", type=int, default=5, help="Number of items to simulate")
     sub_run.add_argument(
         "--include-quarantine",
@@ -368,6 +379,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     """CLI entrypoint callable."""
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if not hasattr(args, "db_path") or args.db_path is None:
+        args.db_path = str(get_default_db_path())
 
     if not args.command:
         parser.print_help()

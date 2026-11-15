@@ -195,3 +195,76 @@ def test_error_message_token_scrubbing(outbox_db):
     err = cur.fetchone()[0]
     assert "SECRET_TOKEN_XYZ" not in err
     assert "***" in err
+
+
+def test_dispatch_batch_preserves_sender_last_error_with_scrubbing(outbox_db):
+    """AUD-019: dispatch_batch captures notifier.last_error and scrubs sensitive tokens."""
+    dispatcher = OutboxDispatcher(outbox_db)
+
+    class MockFailingNotifier:
+        def __init__(self):
+            self.last_error = "HTTP 401 Unauthorized from https://discord.com/api/webhooks/999/LEAKED_WEBHOOK_SECRET_KEY"
+
+        def send(self, ev):
+            return False
+
+        def __call__(self, ev):
+            return self.send(ev)
+
+    notifier = MockFailingNotifier()
+    stats = dispatcher.dispatch_batch(sender=notifier.send, enforce_backoff=False)
+    assert stats["failed"] == 1
+
+    cur = outbox_db.cursor()
+    cur.execute("SELECT last_notification_error FROM price_change_outbox WHERE outbox_id = 'ob-1';")
+    err = cur.fetchone()[0]
+    assert err is not None
+    assert "LEAKED_WEBHOOK_SECRET_KEY" not in err
+    assert "***" in err or "401" in err
+
+
+def test_older_outbox_event_does_not_overwrite_newer_monitor_state(outbox_db):
+    """AUD-019: Processing an older outbox event must not overwrite a newer event's status on b2b_price_monitor."""
+    dispatcher = OutboxDispatcher(outbox_db)
+    test_ek = "a" * 64
+
+    # ob-1 is already in DB from fixture at T1
+    # Add ob-2 at T2 (newer)
+    t2_iso = "2026-11-15T12:00:00+00:00"
+    with transaction(outbox_db) as cur:
+        cur.execute(
+            """
+            INSERT INTO price_change_outbox (
+                outbox_id, entity_key, event_type, payload,
+                notification_status, retry_count, created_at, updated_at
+            ) VALUES ('ob-2-newer', ?, 'PRICE_CHANGED', '{"price": "12.0000"}',
+                      'PENDING', 0, ?, ?);
+            """,
+            (test_ek, t2_iso, t2_iso),
+        )
+        cur.execute(
+            """
+            UPDATE b2b_price_monitor
+            SET notification_status = 'PENDING'
+            WHERE entity_key = ?;
+            """,
+            (test_ek,),
+        )
+
+    # When older event ob-1 fails, it must NOT overwrite b2b_price_monitor to FAILED
+    dispatcher.mark_failed("ob-1", test_ek, "Stale failure for ob-1")
+
+    cur = outbox_db.cursor()
+    cur.execute("SELECT notification_status FROM b2b_price_monitor WHERE entity_key = ?;", (test_ek,))
+    assert cur.fetchone()[0] == "PENDING"  # Protected against stale overwrite!
+
+    # When older event ob-1 is marked dispatched, it must NOT overwrite b2b_price_monitor
+    dispatcher.mark_dispatched("ob-1", test_ek)
+    cur.execute("SELECT notification_status FROM b2b_price_monitor WHERE entity_key = ?;", (test_ek,))
+    assert cur.fetchone()[0] == "PENDING"
+
+    # But when newest event ob-2 is marked dispatched, b2b_price_monitor MUST update
+    dispatcher.mark_dispatched("ob-2-newer", test_ek)
+    cur.execute("SELECT notification_status FROM b2b_price_monitor WHERE entity_key = ?;", (test_ek,))
+    assert cur.fetchone()[0] == "DISPATCHED"
+

@@ -161,3 +161,40 @@ def test_cli_clean_outbox_and_vacuum(cli_db_path, capsys):
     assert exit_vac == 0
     captured_vac = capsys.readouterr()
     assert "PRAGMA wal_checkpoint(TRUNCATE)" in captured_vac.out
+
+
+@pytest.mark.parametrize("subcommand", ["status", "vacuum"])
+def test_cli_db_path_ordering_before_and_after_subcommand(cli_db_path, subcommand, capsys):
+    """AUD-025: --db-path works identically whether passed before or after subcommand verb."""
+    # 1. Passed BEFORE subcommand: `main(["--db-path", path, verb])`
+    exit_before = main(["--db-path", str(cli_db_path), subcommand])
+    assert exit_before == 0
+    captured_before = capsys.readouterr()
+
+    # 2. Passed AFTER subcommand: `main([verb, "--db-path", path])`
+    exit_after = main([subcommand, "--db-path", str(cli_db_path)])
+    assert exit_after == 0
+    captured_after = capsys.readouterr()
+
+    if subcommand == "status":
+        assert "EXECUTIVE DASHBOARD" in captured_before.out
+        assert "EXECUTIVE DASHBOARD" in captured_after.out
+    elif subcommand == "vacuum":
+        assert "PRAGMA wal_checkpoint" in captured_before.out
+        assert "PRAGMA wal_checkpoint" in captured_after.out
+
+
+def test_cli_db_path_ordering_with_flags_after_subcommand(cli_db_path, capsys):
+    """AUD-025: --db-path after subcommand with flags: simulate and clean-outbox."""
+    # simulate with --db-path after verb
+    exit_sim = main(["simulate", "--db-path", str(cli_db_path), "--items", "2"])
+    assert exit_sim == 0
+    captured_sim = capsys.readouterr()
+    assert "SIMULATION INGESTION SUMMARY" in captured_sim.out
+
+    # clean-outbox with --db-path after verb
+    exit_clean = main(["clean-outbox", "--days", "30", "--db-path", str(cli_db_path)])
+    assert exit_clean == 0
+    captured_clean = capsys.readouterr()
+    assert "Purged" in captured_clean.out
+

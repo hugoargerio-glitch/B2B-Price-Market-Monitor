@@ -8,7 +8,7 @@ on:
 
 jobs:
   verify-cdc-engine-and-contracts:
-    name: Pytest (65 Checks) + ODCS v3.2.0 Contract + Docker Gate
+    name: Pytest Verification + ODCS v3.2.0 Contract + Multi-Stage Docker Gate
     runs-on: ubuntu-latest
 
     steps:
@@ -26,7 +26,7 @@ jobs:
       - name: Gate 1 — Lint Executable ODCS v3.2.0 Data Contract
         run: uv run datacontract lint ./contracts/b2b_price_monitor_v1.odcs.yaml
 
-      - name: Gate 2 — Execute 65 Unit, Integration & SQL Invariant Tests
+      - name: Gate 2 — Execute Unit, Integration & SQL Invariant Tests
         run: uv run pytest -v
 
       - name: Gate 3 — Verify End-to-End CLI Simulation, Outbox Dispatch & Housekeeping
@@ -38,6 +38,8 @@ jobs:
 
       - name: Gate 4 — Build & Verify Multi-Stage Docker Container
         run: |
-          docker build -t b2b-price-monitor:ci .
-          docker run --rm --entrypoint pytest b2b-price-monitor:ci -v
+          docker build --target test -t b2b-price-monitor:test .
+          docker run --rm b2b-price-monitor:test -v
+          docker run --rm --entrypoint datacontract b2b-price-monitor:test lint ./contracts/b2b_price_monitor_v1.odcs.yaml
+          docker build --target runtime -t b2b-price-monitor:ci .
           docker run --rm b2b-price-monitor:ci run --items 5 --dry-run

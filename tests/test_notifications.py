@@ -243,3 +243,106 @@ def test_send_url_error_handling(sample_outbox_event):
         success = notifier.send(sample_outbox_event)
         assert success is False
         assert "Connection refused" in notifier.last_error
+
+
+@pytest.mark.parametrize(
+    "ssrf_target",
+    [
+        "file:///etc/passwd",
+        "http://127.0.0.1:9000/webhook",
+        "http://localhost:8080/hook",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5:5000/alert",
+        "http://192.168.0.100/notify",
+    ],
+)
+def test_webhook_notifier_ssrf_blocking(sample_outbox_event, ssrf_target):
+    """AUD-015: WebhookNotifier blocks file:// and private/loopback targets before dispatch."""
+    notifier = WebhookNotifier(webhook_url=ssrf_target, platform="discord")
+    try:
+        success = notifier.send(sample_outbox_event)
+        assert success is False
+        assert notifier.last_error is not None
+        assert any(
+            term in notifier.last_error.lower()
+            for term in ["ssrf", "private", "loopback", "blocked", "scheme", "http", "address"]
+        )
+    except ValueError as exc:
+        assert any(
+            term in str(exc).lower()
+            for term in ["ssrf", "private", "loopback", "blocked", "scheme", "http", "address"]
+        )
+
+
+def test_webhook_notifier_promo_changed_formatting():
+    """AUD-024: WebhookNotifier handles OutboxEventType.PROMO_CHANGED explicitly without fallback."""
+    payload_data = {
+        "sku": "SKU-PROMO-99",
+        "domain": "deal-site.com.br",
+        "canonical_url": "https://deal-site.com.br/deal-item",
+        "product_title": "Promo Product",
+        "current_price": "99.9000",
+        "previous_price": "99.9000",
+        "price_delta": "0.0000",
+        "price_delta_percent": "0.0000",
+        "currency": "BRL",
+        "availability": "IN_STOCK",
+        "promo_badge": "BLACK_FRIDAY_SPECIAL",
+        "event_type": OutboxEventType.PROMO_CHANGED.value,
+    }
+    event = PriceChangeOutbox(
+        outbox_id="test-promo-id",
+        entity_key="p" * 64,
+        event_type=OutboxEventType.PROMO_CHANGED,
+        payload=json.dumps(payload_data),
+        notification_status=NotificationStatus.PENDING,
+    )
+
+    notifier = WebhookNotifier(platform="discord")
+    discord_card = notifier.format_discord(event)
+    assert "PROMO" in discord_card["embeds"][0]["title"]
+    assert "NEW PRODUCT MONITORED" not in discord_card["embeds"][0]["title"]
+
+    notifier_slack = WebhookNotifier(platform="slack")
+    slack_data = notifier_slack.format_slack(event)
+    assert "PROMO" in slack_data["text"]
+    assert "NEW PRODUCT MONITORED" not in slack_data["text"]
+
+    notifier_console = WebhookNotifier(platform="console")
+    console_text = notifier_console.format_console(event)
+    assert "deal-site.com.br" in console_text
+    assert "SKU-PROMO-99" in console_text
+
+
+def test_webhook_notifier_price_changed_null_delta_fallback():
+    """AUD-024: PRICE_CHANGED with price_delta=None must not fall through to NEW PRODUCT MONITORED."""
+    payload_data = {
+        "sku": "SKU-NULL-DELTA",
+        "domain": "competitor-x.com",
+        "canonical_url": "https://competitor-x.com/item",
+        "product_title": "Null Delta Item",
+        "current_price": "500.0000",
+        "previous_price": None,
+        "price_delta": None,
+        "price_delta_percent": None,
+        "currency": "USD",
+        "availability": "IN_STOCK",
+        "event_type": OutboxEventType.PRICE_CHANGED.value,
+    }
+    event = PriceChangeOutbox(
+        outbox_id="test-null-delta",
+        entity_key="d" * 64,
+        event_type=OutboxEventType.PRICE_CHANGED,
+        payload=json.dumps(payload_data),
+        notification_status=NotificationStatus.PENDING,
+    )
+
+    notifier = WebhookNotifier(platform="discord")
+    discord_card = notifier.format_discord(event)
+    assert "NEW PRODUCT MONITORED" not in discord_card["embeds"][0]["title"]
+    assert "PRICE" in discord_card["embeds"][0]["title"]
+
+    notifier_slack = WebhookNotifier(platform="slack")
+    slack_data = notifier_slack.format_slack(event)
+    assert "NEW PRODUCT MONITORED" not in slack_data["text"]
+

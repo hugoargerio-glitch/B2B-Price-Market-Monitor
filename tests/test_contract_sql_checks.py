@@ -4,8 +4,10 @@ against an isolated temporary SQLite database populated via seed_database.
 """
 
 from decimal import Decimal
+from pathlib import Path
 import sqlite3
 import pytest
+import yaml
 
 from src.seed import seed_database
 from src.storage import get_connection, init_db
@@ -158,3 +160,51 @@ def test_contract_text_decimal_storage(prod_db):
     assert prev_type == "text"
     assert delta_type == "text"
     assert pct_type == "text"
+
+
+def test_dynamic_execution_of_all_contract_quality_sql_queries(prod_db):
+    """AUD-025: Dynamically extracts and executes 100% of SQL quality queries from ODCS YAML."""
+    contract_path = Path(__file__).resolve().parent.parent / "contracts" / "b2b_price_monitor_v1.odcs.yaml"
+    assert contract_path.exists(), f"Contract file not found at {contract_path}"
+
+    with open(contract_path, "r", encoding="utf-8") as f:
+        contract_data = yaml.safe_load(f)
+
+    cur = prod_db.cursor()
+    executed_checks = 0
+
+    for table_def in contract_data.get("schema", []):
+        table_name = table_def.get("physicalName") or table_def.get("name")
+
+        # Table-level quality checks
+        for q in table_def.get("quality", []):
+            if q.get("type") == "sql" and "query" in q:
+                raw_query = q["query"].strip()
+                sql_query = raw_query.replace("{table}", table_name)
+                expected_must_be = q.get("mustBe", 0)
+                cur.execute(sql_query)
+                actual_result = cur.fetchone()[0]
+                assert actual_result == expected_must_be, (
+                    f"Contract SQL check failed for table {table_name}: "
+                    f"Query '{sql_query}' returned {actual_result}, expected {expected_must_be}."
+                )
+                executed_checks += 1
+
+        # Property-level quality checks
+        for prop in table_def.get("properties", []):
+            prop_name = prop.get("name")
+            for q in prop.get("quality", []):
+                if q.get("type") == "sql" and "query" in q:
+                    raw_query = q["query"].strip()
+                    sql_query = raw_query.replace("{table}", table_name)
+                    expected_must_be = q.get("mustBe", 0)
+                    cur.execute(sql_query)
+                    actual_result = cur.fetchone()[0]
+                    assert actual_result == expected_must_be, (
+                        f"Contract SQL check failed for property {table_name}.{prop_name}: "
+                        f"Query '{sql_query}' returned {actual_result}, expected {expected_must_be}."
+                    )
+                    executed_checks += 1
+
+    assert executed_checks >= 7, f"Expected at least 7 contract SQL checks, executed {executed_checks}"
+

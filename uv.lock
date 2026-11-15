@@ -42,15 +42,36 @@ name = "b2b-price-monitor"
 version = "1.0.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "datacontract-cli" },
     { name = "pydantic" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
+]
+
+[package.optional-dependencies]
+dev = [
+    { name = "datacontract-cli" },
+    { name = "pytest" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "datacontract-cli" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "datacontract-cli", specifier = ">=0.10.14" },
+    { name = "datacontract-cli", marker = "extra == 'dev'", specifier = ">=0.10.14" },
     { name = "pydantic", specifier = ">=2.9.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.0" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
+]
+provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "datacontract-cli", specifier = ">=0.10.14" },
     { name = "pytest", specifier = ">=8.3.0" },
 ]
 

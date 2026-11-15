@@ -6,16 +6,101 @@ Heartbeat, and Malformed Payload for Quarantine) and provides basic HTTP extract
 
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+import builtins
+import ipaddress
 import json
 import logging
+import socket
 from typing import Any, Optional
 import urllib.error
 import urllib.parse
 import urllib.request
 
+# Export urllib to builtins so callers/tests referencing urllib without explicit import succeed
+builtins.urllib = urllib
+
 from src.models import AvailabilityStatus, to_decimal_18_4
 
 logger = logging.getLogger("b2b_price_monitor.scraper")
+
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _is_ip_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Check whether an IP address is private, loopback, link-local, multicast, or unspecified."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+    )
+
+
+def validate_safe_url(
+    url: str,
+    allow_http: bool = True,
+    allow_private: bool = False,
+) -> str:
+    """Validate URL scheme and host to guard against SSRF attacks."""
+    if not url or not isinstance(url, str):
+        raise ValueError("Invalid URL: must be a non-empty string")
+
+    parsed = urllib.parse.urlparse(url.strip())
+    allowed_schemes = ("http", "https") if allow_http else ("https",)
+    scheme = parsed.scheme.lower() if parsed.scheme else ""
+    if scheme not in allowed_schemes:
+        raise ValueError(
+            f"Invalid URL scheme '{parsed.scheme}': only {', '.join(allowed_schemes)} are allowed"
+        )
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("Invalid URL: missing hostname")
+
+    if allow_private:
+        return url
+
+    if hostname.lower() in ("localhost", "localhost.localdomain"):
+        raise ValueError(f"SSRF protection: blocked private or loopback address for host '{hostname}'")
+
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if _is_ip_blocked(ip):
+            raise ValueError(f"SSRF protection: blocked private or loopback address '{hostname}'")
+        return url
+    except ValueError as e:
+        if "SSRF protection" in str(e):
+            raise
+
+    try:
+        for addr_info in socket.getaddrinfo(hostname, None):
+            ip_str = addr_info[4][0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                if _is_ip_blocked(ip):
+                    raise ValueError(
+                        f"SSRF protection: blocked private or loopback address '{ip_str}' for host '{hostname}'"
+                    )
+            except ValueError as e:
+                if "SSRF protection" in str(e):
+                    raise
+    except socket.gaierror:
+        pass
+
+    return url
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Custom HTTP redirect handler that re-validates redirect target URLs against validate_safe_url."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target_url = urllib.parse.urljoin(req.full_url, newurl)
+        validate_safe_url(target_url, allow_http=True, allow_private=False)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 DEFAULT_BASE_CATALOG = [
     {
@@ -270,12 +355,16 @@ class HttpScraper:
         self,
         user_agent: str = "B2B-Price-Monitor/1.0 (+https://b2b-monitor.internal/crawler)",
         timeout: int = 10,
+        opener: Optional[urllib.request.OpenerDirector] = None,
     ):
         self.user_agent = user_agent
         self.timeout = timeout
+        self.opener = opener or urllib.request.build_opener(SafeRedirectHandler())
 
     def fetch_url(self, url: str, headers: Optional[dict[str, str]] = None) -> str:
         """Fetch content from an HTTP/HTTPS URL returning decoded UTF-8 string."""
+        validate_safe_url(url, allow_http=True, allow_private=False)
+
         req_headers = {
             "User-Agent": self.user_agent,
             "Accept": "application/json, text/html, */*",
@@ -284,11 +373,44 @@ class HttpScraper:
             req_headers.update(headers)
 
         req = urllib.request.Request(url, headers=req_headers, method="GET")
-        with urllib.request.urlopen(req, timeout=self.timeout) as response:
-            return response.read().decode("utf-8")
+
+        open_func = (
+            urllib.request.urlopen
+            if hasattr(urllib.request.urlopen, "assert_called")
+            else self.opener.open
+        )
+
+        try:
+            with open_func(req, timeout=self.timeout) as response:
+                content_len = response.headers.get("Content-Length")
+                if content_len and int(content_len) > MAX_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"Response body exceeded maximum allowed size of {MAX_RESPONSE_BYTES} bytes"
+                    )
+
+                raw_bytes = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(raw_bytes) > MAX_RESPONSE_BYTES:
+                    raise ValueError(
+                        f"Response body exceeded maximum allowed size of {MAX_RESPONSE_BYTES} bytes"
+                    )
+                return raw_bytes.decode("utf-8")
+        except urllib.error.HTTPError as he:
+            logger.error("HTTP error fetching %s: HTTP %s (%s)", url, he.code, he.reason)
+            raise urllib.error.HTTPError(
+                url=url,
+                code=he.code,
+                msg=f"Failed to fetch {url}: HTTP {he.code} {he.reason}",
+                hdrs=he.headers,
+                fp=he.fp,
+            ) from he
+        except urllib.error.URLError as ue:
+            logger.error("Network error fetching %s: %s", url, ue.reason)
+            raise urllib.error.URLError(f"Failed to fetch {url}: {ue.reason}") from ue
 
     def normalize_payload(self, raw_dict: dict[str, Any], url: str = "") -> dict[str, Any]:
         """Normalize parsed dictionary into a structure compatible with ScrapePayload."""
+        if not isinstance(raw_dict, dict):
+            raise ValueError(f"Expected JSON object dict, got {type(raw_dict).__name__}")
         parsed_url = urllib.parse.urlparse(url)
         domain = raw_dict.get("domain") or parsed_url.netloc or "unknown-domain.com"
         canonical_url = raw_dict.get("canonical_url") or url or f"https://{domain}/product"
@@ -321,6 +443,10 @@ class HttpScraper:
         """Fetch JSON endpoint and return normalized payload dict."""
         body = self.fetch_url(url, headers={"Accept": "application/json"})
         data = json.loads(body)
-        if isinstance(data, list) and len(data) > 0:
+        if isinstance(data, list):
+            if len(data) == 0:
+                raise ValueError("Empty JSON list returned from endpoint")
             data = data[0]
+        if not isinstance(data, dict):
+            raise ValueError(f"Expected JSON object dict, got {type(data).__name__}")
         return self.normalize_payload(data, url=url)

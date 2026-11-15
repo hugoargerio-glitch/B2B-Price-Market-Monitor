@@ -179,7 +179,7 @@ def purge_dispatched_outbox(conn: sqlite3.Connection, retention_days: int = 30) 
             """
             DELETE FROM price_change_outbox
             WHERE notification_status = 'DISPATCHED'
-              AND updated_at < ?;
+              AND REPLACE(updated_at, 'Z', '+00:00') < REPLACE(?, 'Z', '+00:00');
             """,
             (cutoff_iso,),
         )

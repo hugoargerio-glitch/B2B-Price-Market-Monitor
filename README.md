@@ -4,7 +4,7 @@
 [![Storage Engine](https://img.shields.io/badge/Storage-SQLite_3_(WAL_Mode)-003B57?style=flat-square)](./src/storage.py)
 [![Validation](https://img.shields.io/badge/Shift--Left-Pydantic_v2_(DECIMAL_18,4)-E92063?style=flat-square)](./src/models.py)
 [![Pattern](https://img.shields.io/badge/Pattern-Transactional_Outbox_%7C_Dual--Hash_CDC-10B981?style=flat-square)](./src/diff_engine.py)
-[![Tests](https://img.shields.io/badge/Tests-65_Passed_(0.26s)-2ECC71?style=flat-square)](./tests/)
+[![Tests](https://img.shields.io/badge/Tests-100+_Passed-2ECC71?style=flat-square)](./tests/)
 [![Docker](https://img.shields.io/badge/Container-Multi--Stage_Docker-2496ED?style=flat-square)](./Dockerfile)
 [![License: MIT](https://img.shields.io/badge/License-MIT-F59E0B?style=flat-square)](./LICENSE)
 
@@ -24,9 +24,9 @@ Conventional price monitoring scripts and amateur web scrapers suffer from **fiv
 **`b2b-price-monitor` resolves every one of these failure modes through deterministic engineering**:
 - **Executable Data Contract First (`ODCS v3.2.0`)**: Physical schemas, closed-domain enums, and 8 live SQL quality invariants are governed by [`contracts/b2b_price_monitor_v1.odcs.yaml`](./contracts/b2b_price_monitor_v1.odcs.yaml).
 - **Dual-Hash CDC Engine (`entity_key` + `state_hash`)**: Unchanged SKUs execute a silent `last_checked_at` heartbeat update with **zero** outbox events generated.
-- **Strict Monetary Invariant (`Zero FLOAT`)**: Every monetary value is rejected at the Pydantic boundary if passed as a `float`, quantized to `DECIMAL(18,4)` (`ROUND_HALF_UP`), and reconciled against integer `BIGINT` cents.
+- **Strict Monetary Invariant (`Zero FLOAT`)**: Every monetary value is rejected at the Pydantic boundary if passed as a `float`, quantized to `DECIMAL(18,4)` (`ROUND_HALF_UP`), and reconciled against integer `BIGINT` cents. Logical `DECIMAL(18,4)` values are stored physically as `TEXT` in SQLite alongside `BIGINT` `current_price_cents` to strictly prevent SQLite `NUMERIC` affinity coercion to IEEE 754 `REAL`.
 - **ACID Transactional Outbox + Exponential Backoff**: State mutations and outbox notifications commit atomically under `BEGIN IMMEDIATE`, while delivery retries follow exponential backoff with full jitter up to a 5-attempt Dead-Letter Queue (`DEAD_LETTER`).
-- **Statistically Guarded Circuit Breaker**: Halts outbound notifications for a domain only when sample size $N \ge 10$ and quarantine failure rate exceeds $20\%$.
+- **Statistically Guarded Circuit Breaker**: Halts customer-facing outbound notifications (`CIRCUIT_HALTED`) and triggers a `TEMPLATE_DRIFT_DETECTED` administrative alert for a domain only when sample size $N \ge 10$ and quarantine failure rate exceeds $20\%$.
 
 ---
 
@@ -42,7 +42,7 @@ flowchart TD
     subgraph S2["2. SHIFT-LEFT VALIDATION & SELF-DEFENSE"]
         C -->|Malformed / Float / Negative Price| Q["Quarantine Dead-Letter Queue (DLQ)<br/>b2b_price_monitor_quarantine"]
         C -->|Valid Payload (DECIMAL 18,4)| D["Domain Circuit Breaker Pre-Scan<br/>(min_sample_size >= 10)"]
-        D -->|Sample >= 10 AND Failure Rate > 20%| CB["🚨 CIRCUIT BREAKER TRIPPED<br/>Halts Domain Alerts on Template Drift"]
+        D -->|Sample >= 10 AND Failure Rate > 20%| CB["🚨 CIRCUIT BREAKER TRIPPED<br/>(TEMPLATE_DRIFT_DETECTED / CIRCUIT_HALTED)"]
         D -->|Normal Flow| E["Dual-Hash CDC Diff Engine"]
     end
 
@@ -56,7 +56,7 @@ flowchart TD
         F -->|Identical state_hash| G["Silent Heartbeat Update ONLY<br/>(last_checked_at = NOW)<br/>Zero Outbox Events!"]
         F -->|New Entity (First Capture)| H["BEGIN IMMEDIATE TRANSACTION"]
         F -->|Mutated state_hash (Drift)| H
-        H -->|Upsert Operational State| T1["Operational State Table (SCD Type 1)<br/>product_price_state & b2b_price_monitor"]
+        H -->|Upsert Operational State| T1["Operational State Table (SCD Type 1)<br/>b2b_price_monitor"]
         H -->|Append Mutation Event| T2["Transactional Outbox & Event Ledger<br/>price_change_outbox (Status: PENDING)"]
         H -->|COMMIT| K["Atomically Consolidated State & Event"]
     end
@@ -118,47 +118,51 @@ Every payload ingested into `b2b-price-monitor` traverses a deterministic 5-stag
 
 ### Stage 1 — Pluggable Data Ingestion & Edge Decoupling ([`src/scraper.py`](./src/scraper.py))
 - **Zero-Dependency HTTP Collector (`HttpScraper`)**: Normalizes raw HTML/JSON responses with strict 10-second timeouts, canonical URL extraction, uppercase SKU sanitization, and domain normalization.
-- **Headless / Anti-Bot Edge Decoupling**: For JavaScript-heavy SPAs (React/Next.js) or WAF-protected targets, external edge collectors (*Playwright*, *Scrapy*, *Crawlee*) drop standardized JSON batches directly into [`make ingest FILE=examples/sample_scrape_batch.json`](./src/main.py#L66-L104) without touching core CDC logic.
+- **Headless / Anti-Bot Edge Decoupling**: For JavaScript-heavy SPAs (React/Next.js) or WAF-protected targets, external edge collectors (*Playwright*, *Scrapy*, *Crawlee*) drop standardized JSON batches directly into [`make ingest FILE=examples/sample_scrape_batch.json`](./src/main.py#L71-L110) without touching core CDC logic.
 
 ### Stage 2 — Shift-Left Validation & Statistical Circuit Breaker ([`src/models.py`](./src/models.py), [`src/pipeline.py`](./src/pipeline.py))
-- **Zero-Float Monetary Enforcement**: Passing a native Python `float` (e.g., `199.99`) raises a deterministic validation error before touching the database. All prices are quantized to `DECIMAL(18,4)` using `ROUND_HALF_UP` and paired with integer cents:
+- **Zero-Float Monetary Enforcement**: Passing a native Python `float` (e.g., `199.99`) raises a deterministic validation error before touching the database. All prices are quantized to `DECIMAL(18,4)` using `ROUND_HALF_UP`, paired with integer cents, and persisted physically as `TEXT` in SQLite DDL (`current_price`, `previous_price`, `price_delta`, `price_delta_percent`) alongside `BIGINT` `current_price_cents` to strictly prevent SQLite `NUMERIC` affinity from coercing monetary amounts to IEEE 754 `REAL`:
   $$\text{CAST}(\text{ROUND}(\text{current\_price} \times 100, 0)\text{ AS BIGINT}) == \text{current\_price\_cents}$$
 - **Shift-Left Quarantine DLQ**: Malformed payloads are isolated in `b2b_price_monitor_quarantine` with full raw JSON context and `failure_reason` (`VALIDATION_ERROR`, `FLOAT_FORBIDDEN`, `NEGATIVE_PRICE`, `MISSING_REQUIRED_FIELD`) without aborting valid items in the batch.
 - **Small-Sample Protected Circuit Breaker**: Prevents false-positive trips on small domains by requiring a minimum sample size (`min_sample_size = 10`) alongside the $20\%$ failure threshold:
   $$\text{Circuit Breaker Trip} \iff (\text{Total}_{\text{domain}} \ge 10) \land \left(\frac{\text{Quarantined}_{\text{domain}}}{\text{Total}_{\text{domain}}} > 0.20\right)$$
+  When tripped, customer notifications transition to `CIRCUIT_HALTED` (`HALTED_BY_CIRCUIT_BREAKER`) and an administrative `TEMPLATE_DRIFT_DETECTED` alert is immediately dispatched to protect downstream channels while alerting operators.
 
 ### Stage 3 — Deterministic Dual-Hash Diff Engine ([`src/diff_engine.py`](./src/diff_engine.py))
 1. **Primary Identity Key (`entity_key`)**:
-   $$\text{entity\_key} = \text{SHA-256}(\text{lower}(\text{trim}(\text{domain})) \parallel \text{"::"} \parallel \text{upper}(\text{trim}(\text{sku})))$$
+   $$\text{entity\_key} = \text{SHA-256}(\text{LOWER}(\text{TRIM}(\text{domain})) \parallel \text{"::"} \parallel \text{UPPER}(\text{TRIM}(\text{sku})))$$
 2. **Business State Signature (`state_hash`)**:
-   $$\text{state\_hash} = \text{SHA-256}(\text{current\_price\_cents} \parallel \text{"\|"} \parallel \text{currency\_code} \parallel \text{"\|"} \parallel \text{availability\_status} \parallel \text{"\|"} \parallel \text{COALESCE}(\text{promo\_badge}, \text{""}))$$
+   $$\text{state\_hash} = \text{SHA-256}(\text{CAST}(\text{current\_price\_cents AS TEXT}) \parallel \text{"\|"} \parallel \text{UPPER}(\text{TRIM}(\text{currency\_code})) \parallel \text{"\|"} \parallel \text{UPPER}(\text{TRIM}(\text{availability\_status})) \parallel \text{"\|"} \parallel \text{COALESCE}(\text{TRIM}(\text{promo\_badge}), \text{""}))$$
    - **Zero Transient Metadata**: `scraped_at`, HTTP headers, and proxy IPs are strictly excluded from `state_hash`.
    - **Guarded Price Delta Math**: Supports negative deltas on price drops while guarding against division by zero:
-     $$\text{price\_delta\_percent} = \begin{cases} 0.0000 & \text{if } \text{previous\_price IS NULL or } \text{previous\_price} = 0 \\ \frac{\text{current\_price} - \text{previous\_price}}{\text{previous\_price}} \times 100 & \text{otherwise} \end{cases}$$
+     $$\text{price\_delta} = \text{current\_price} - \text{COALESCE}(\text{previous\_price}, \text{current\_price})$$
+     $$\text{price\_delta\_percent} = \begin{cases} 0.0000 & \text{if } \text{previous\_price IS NULL or } \text{previous\_price} = 0 \\ \frac{\text{current\_price} - \text{previous\_price}}{\text{previous\_price}} \times 100.0000 & \text{otherwise} \end{cases}$$
 
-### Stage 4 — Single-Writer SQLite WAL & Operational vs. Analytical Grain ([`src/storage.py`](./src/storage.py))
+### Stage 4 — Single-Writer SQLite WAL & Operational State Table ([`src/storage.py`](./src/storage.py))
 - **Concurrency Invariant (`WAL` + `BEGIN IMMEDIATE`)**: Configured with `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA busy_timeout = 5000`. Sequential single-process batch writes complete in sub-milliseconds while allowing non-blocking concurrent reads.
-- **Operational State (SCD Type 1) vs. Historical Event Ledger**:
-  - `product_price_state` and `b2b_price_monitor` maintain 1 row per `entity_key` (SCD Type 1) for $O(\log N)$ B-Tree point lookups.
-  - `price_change_outbox` acts as both the transactional notification queue and the chronological append-only mutation ledger (`INITIAL_CAPTURE`, `PRICE_CHANGE`, `AVAILABILITY_CHANGE`, `PROMO_CHANGE`).
+- **Single Canonical Operational State Table (`b2b_price_monitor`)**:
+  - `b2b_price_monitor` serves as the single canonical operational state table maintaining 1 row per `entity_key` (SCD Type 1) for sub-millisecond B-Tree point lookups (legacy aliases like `product_price_state` are completely eliminated).
+  - Logical `DECIMAL(18,4)` columns (`current_price`, `previous_price`, `price_delta`, `price_delta_percent`) are stored physically as `TEXT` in SQLite DDL alongside `BIGINT` `current_price_cents` to strictly prevent SQLite `NUMERIC` type affinity coercion to IEEE 754 `REAL`.
+  - `price_change_outbox` acts as both the transactional notification queue and chronological append-only mutation ledger using exact `OutboxEventType` names (`INITIAL_CAPTURE`, `PRICE_CHANGED`, `AVAILABILITY_CHANGED`, `PROMO_CHANGED`).
 
 ### Stage 5 — Outbox Dispatcher, Exponential Backoff & Housekeeping ([`src/outbox.py`](./src/outbox.py), [`src/notifications.py`](./src/notifications.py))
-- **Exponential Backoff with Full Jitter**: Protects downstream webhooks from HTTP 429 rate limits:
+- **Outbox Lifecycle FSM & Exponential Backoff with Full Jitter**:
+  Outbox records follow deterministic state transitions (`PENDING -> DISPATCHED | FAILED -> DEAD_LETTER`, plus `CIRCUIT_HALTED` upon domain circuit breaker trip). Backoff protects downstream webhooks from HTTP 429 rate limits:
   $$t_{\text{wait}} = \min\left(t_{\text{max}},\, t_{\text{base}} \times 2^{\text{retry\_count}}\right) + \text{Uniform}(0, t_{\text{base}})$$
-  Events exceeding `max_retries = 5` transition permanently to `DEAD_LETTER`.
-- **Automated Storage Housekeeping**: `make clean-outbox` purges `DISPATCHED` outbox rows older than 30 days (preserving `PENDING`, `FAILED`, and `DEAD_LETTER` records), and `make vacuum` executes `PRAGMA wal_checkpoint(TRUNCATE); VACUUM;` to reclaim disk pages.
+  Events exceeding `max_retries = 5` transition permanently to `DEAD_LETTER`. Webhook tokens are automatically scrubbed from `last_notification_error`.
+- **Automated Storage Housekeeping**: `make clean-outbox` purges `DISPATCHED` outbox rows older than 30 days (strictly preserving `PENDING`, `FAILED`, `DEAD_LETTER`, and `CIRCUIT_HALTED` records), and `make vacuum` executes `PRAGMA wal_checkpoint(TRUNCATE); VACUUM;` to reclaim disk pages.
 
 ---
 
 ## 4. The 5 Deterministic Quality Gates
 
 | Quality Gate | Verified Engineering Invariant | Source Implementation & Evidence | Test Status |
-| :--- | :--- | :--- | :---: |
+| :--- | :--- | :--- | :--- |
 | **Gate 1: ODCS v3.2.0 Contract Compliance** | Physical tables, column types, closed enums, and 8 SQL quality checks match contract. | [`contracts/b2b_price_monitor_v1.odcs.yaml`](./contracts/b2b_price_monitor_v1.odcs.yaml)<br/>[`tests/test_contract_sql_checks.py`](./tests/test_contract_sql_checks.py) | 🟢 **PASS** |
 | **Gate 2: Entity Grain & B-Tree Uniqueness** | Strict 1 row per `(domain, sku)` via `entity_key` primary key; zero duplicate rows. | [`src/diff_engine.py:18-33`](./src/diff_engine.py#L18-L33)<br/>[`src/storage.py:20-103`](./src/storage.py#L20-L103) | 🟢 **PASS** |
-| **Gate 3: Financial Precision (`Zero FLOAT`)** | Rejects `float` inputs; enforces `DECIMAL(18,4)`, integer cent parity, and signed deltas. | [`src/models.py:42-145`](./src/models.py#L42-L145)<br/>[`tests/test_models.py`](./tests/test_models.py) | 🟢 **PASS** |
-| **Gate 4: Dual-Hash CDC & ACID Outbox** | Timestamp-free `state_hash`, silent heartbeats, `BEGIN IMMEDIATE`, and Exponential Backoff. | [`src/pipeline.py:140-408`](./src/pipeline.py#L140-L408)<br/>[`src/outbox.py:17-105`](./src/outbox.py#L17-L105) | 🟢 **PASS** |
-| **Gate 5: Shift-Left DLQ & Circuit Breaker** | Routes bad payloads to DLQ; trips domain breaker only when $N \ge 10$ and failure rate $> 20\%$. | [`src/pipeline.py:69-105`](./src/pipeline.py#L69-L105)<br/>[`src/pipeline.py:427-445`](./src/pipeline.py#L427-L445) | 🟢 **PASS** |
+| **Gate 3: Financial Precision (`Zero FLOAT`)** | Rejects `float` inputs; enforces `DECIMAL(18,4)` stored as `TEXT`, integer cent parity, and signed deltas. | [`src/models.py:44-150`](./src/models.py#L44-L150)<br/>[`tests/test_models.py`](./tests/test_models.py) | 🟢 **PASS** |
+| **Gate 4: Dual-Hash CDC & ACID Outbox** | Timestamp-free `state_hash`, silent heartbeats, `BEGIN IMMEDIATE`, and Exponential Backoff. | [`src/pipeline.py:134-353`](./src/pipeline.py#L134-L353)<br/>[`src/outbox.py:27-237`](./src/outbox.py#L27-L237) | 🟢 **PASS** |
+| **Gate 5: Shift-Left DLQ & Circuit Breaker** | Routes bad payloads to DLQ; trips domain breaker only when $N \ge 10$ and failure rate $> 20\%$. | [`src/pipeline.py:67-103`](./src/pipeline.py#L67-L103)<br/>[`src/pipeline.py:372-425`](./src/pipeline.py#L372-L425) | 🟢 **PASS** |
 
 ---
 
@@ -186,7 +190,7 @@ b2b-price-monitor/
 ├── LICENSE                                        # MIT Open-Source License
 ├── .github/
 │   └── workflows/
-│       └── ci.yml                                 # 4-Gate GitHub Actions CI (ODCS Lint + 65 Pytest + CLI + Docker)
+│       └── ci.yml                                 # 4-Gate GitHub Actions CI (ODCS Lint + Pytest + CLI + Docker)
 ├── contracts/
 │   └── b2b_price_monitor_v1.odcs.yaml             # Executable ODCS v3.2.0 Data Contract specification
 ├── examples/
@@ -205,7 +209,7 @@ b2b-price-monitor/
 │   ├── diff_engine.py                             # SHA-256 Dual-Hash (`entity_key`, `state_hash`) & delta math
 │   ├── storage.py                                 # DDL, `BEGIN IMMEDIATE` ACID context manager & housekeeping
 │   ├── pipeline.py                                # CDC ingestion engine, DLQ routing & Domain Circuit Breaker
-│   ├── outbox.py                                  # 4-state Outbox machine & Exponential Backoff with Full Jitter
+│   ├── outbox.py                                  # 5-state Outbox machine & Exponential Backoff with Full Jitter
 │   ├── notifications.py                           # Multi-channel webhook adapter (Discord, Slack, Console ASCII)
 │   ├── scraper.py                                 # MarketSimulator & zero-dependency HttpScraper
 │   ├── seed.py                                    # Deterministic database seeder for contract verification
@@ -219,7 +223,9 @@ b2b-price-monitor/
     ├── test_notifications.py                      # Discord embed, Slack Block Kit & HTTP error handling tests
     ├── test_scraper.py                            # Drift simulation & HTTP payload normalization tests
     ├── test_contract_sql_checks.py                # 8 ODCS v3.2.0 live SQL invariant reconciliation tests
-    └── test_cli.py                                # Subcommand integration tests (`run`, `ingest`, `clean-outbox`, `vacuum`)
+    ├── test_cli.py                                # Subcommand integration tests (`run`, `ingest`, `clean-outbox`, `vacuum`)
+    ├── test_seed.py                               # Seed CLI and database initialization verification tests
+    └── test_concurrency.py                        # Concurrent WAL readers & multi-threaded pipeline resilience tests
 ```
 
 ---
@@ -235,7 +241,7 @@ cd b2b-price-monitor
 cp .env.example .env
 make setup
 
-# 2. Run the complete verification loop (65 tests + ODCS v3.2.0 lint + dry-run simulation)
+# 2. Run the complete verification loop (100+ tests + ODCS v3.2.0 lint + dry-run simulation)
 make all
 
 # 3. Ingest an external JSON batch and dispatch notifications
@@ -252,7 +258,7 @@ No local Python installation required. The multi-stage [`Dockerfile`](./Dockerfi
 # 1. Build the production container image
 make docker-build
 
-# 2. Execute all 65 unit/integration tests + ODCS v3.2.0 contract linter inside Docker
+# 2. Execute all 100+ unit/integration tests + ODCS v3.2.0 contract linter inside Docker
 make docker-test
 
 # 3. Run the end-to-end simulation -> webhook dispatch -> executive dashboard inside Docker
@@ -276,7 +282,7 @@ Set `B2B_WEBHOOK_URL` in your `.env` file (or pass it as an environment variable
 | Make Target | Underlying CLI Command | Operational Purpose | Verified Benchmark |
 | :--- | :--- | :--- | :--- |
 | `make setup` | `uv sync` | Installs locked dependencies into `.venv` | `~0.35s` |
-| `make test` | `uv run pytest -v` | Runs all 65 unit, integration, and SQL contract tests | **`0.26s`** (65/65 PASS) |
+| `make test` | `uv run pytest -v` | Runs all 100+ unit, integration, and SQL contract tests | **`100+ PASS`** |
 | `make contract-lint` | `uv run datacontract lint ./contracts/*.odcs.yaml` | Validates YAML against official ODCS v3.2.0 schema | **`0.23s`** (1/1 PASS) |
 | `make simulate` | `python -m src.main simulate` | Generates realistic market price/stock drift and ingests | `~15ms` |
 | `make ingest FILE=...` | `python -m src.main ingest --file <path>` | Ingests an external JSON payload array into SQLite WAL | `~12ms` |
@@ -286,7 +292,7 @@ Set `B2B_WEBHOOK_URL` in your `.env` file (or pass it as an environment variable
 | `make vacuum` | `python -m src.main vacuum` | Runs `PRAGMA wal_checkpoint(TRUNCATE)` and `VACUUM` | `~15ms` |
 | `make run` | `python -m src.main run` | Executes `simulate` $\rightarrow$ `dispatch` $\rightarrow$ `status` end-to-end | `~45ms` |
 | `make docker-build` | `docker build -t b2b-price-monitor:latest .` | Builds the multi-stage production Docker image | Multi-stage cached |
-| `make docker-test` | `docker run --rm --entrypoint pytest ...` | Runs 65 pytest checks + ODCS lint inside container | Container verified |
+| `make docker-test` | `docker run --rm --entrypoint pytest ...` | Runs 100+ pytest checks + ODCS lint inside container | Container verified |
 | `make docker-run` | `docker run --rm b2b-price-monitor:latest run` | Runs the full end-to-end flow inside Docker | Container verified |
 
 ---

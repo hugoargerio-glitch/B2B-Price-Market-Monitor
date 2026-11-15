@@ -135,9 +135,15 @@ class OutboxDispatcher:
                 """
                 UPDATE b2b_price_monitor
                 SET notification_status = 'DISPATCHED'
-                WHERE entity_key = ?;
+                WHERE entity_key = ?
+                  AND (
+                      SELECT outbox_id FROM price_change_outbox
+                      WHERE entity_key = ?
+                      ORDER BY rowid DESC
+                      LIMIT 1
+                  ) = ?;
                 """,
-                (entity_key,),
+                (entity_key, entity_key, outbox_id),
             )
 
     def mark_failed(self, outbox_id: str, entity_key: str, error_message: str) -> NotificationStatus:
@@ -178,9 +184,15 @@ class OutboxDispatcher:
                 SET notification_status = ?,
                     retry_count = ?,
                     last_notification_error = ?
-                WHERE entity_key = ?;
+                WHERE entity_key = ?
+                  AND (
+                      SELECT outbox_id FROM price_change_outbox
+                      WHERE entity_key = ?
+                      ORDER BY rowid DESC
+                      LIMIT 1
+                  ) = ?;
                 """,
-                (new_status.value, new_retries, truncated_err, entity_key),
+                (new_status.value, new_retries, truncated_err, entity_key, entity_key, outbox_id),
             )
             return new_status
 
@@ -209,7 +221,7 @@ class OutboxDispatcher:
                     self.mark_dispatched(ev.outbox_id, ev.entity_key)
                     stats["dispatched"] += 1
                 else:
-                    err_msg = getattr(bound_self, "last_error", None) or "Sender returned failure status"
+                    err_msg = getattr(bound_self, "last_error", None) or getattr(sender, "last_error", None) or "Sender returned failure status"
                     status = self.mark_failed(ev.outbox_id, ev.entity_key, err_msg)
                     if status == NotificationStatus.DEAD_LETTER:
                         stats["dead_letter"] += 1

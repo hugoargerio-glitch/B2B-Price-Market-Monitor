@@ -4,6 +4,7 @@ Verifies WAL mode, PRAGMAs, single table DDL, TEXT decimal storage,
 indexes, and primary key uniqueness.
 """
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import sqlite3
 import pytest
@@ -212,3 +213,69 @@ def test_purge_dispatched_outbox_and_vacuum(temp_db):
 
     # Verify checkpoint_and_vacuum executes cleanly
     checkpoint_and_vacuum(temp_db)
+
+
+@pytest.mark.parametrize(
+    "offset_days,offset_hours,tz_suffix,status,should_purge",
+    [
+        (29, 0, "+00:00", "DISPATCHED", False),   # 29d: within retention window, keep
+        (29, 23, "Z", "DISPATCHED", False),       # 29d23h: within retention window, keep
+        (30, 2, "+00:00", "DISPATCHED", True),    # 30d2h: older than 30d cutoff, purge
+        (30, 2, "Z", "DISPATCHED", True),         # 30d2h with 'Z': older than 30d cutoff, purge
+        (31, 0, "+00:00", "DISPATCHED", True),    # 31d: older than 30d cutoff, purge
+        (31, 0, "Z", "DISPATCHED", True),         # 31d with 'Z': older than 30d cutoff, purge
+        (45, 0, "+00:00", "FAILED", False),       # FAILED: never purged
+        (45, 0, "Z", "DEAD_LETTER", False),       # DEAD_LETTER: never purged
+        (45, 0, "+00:00", "CIRCUIT_HALTED", False),# CIRCUIT_HALTED: never purged
+        (45, 0, "Z", "PENDING", False),           # PENDING: never purged
+    ],
+)
+def test_purge_dispatched_outbox_boundary_and_tz_formats(
+    temp_db, offset_days, offset_hours, tz_suffix, status, should_purge
+):
+    """AUD-021: Parameterized boundary tests for 29d, 30d, 31d, Z vs +00:00, and non-DISPATCHED safety."""
+    ek = compute_entity_key("domain.com", f"SKU-BOUND-{offset_days}-{offset_hours}-{status}-{tz_suffix}")
+    sh = compute_state_hash(1000, "USD", "IN_STOCK")
+    now = datetime.now(timezone.utc)
+    ts = now - timedelta(days=offset_days, hours=offset_hours)
+
+    if tz_suffix == "Z":
+        formatted_ts = ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        formatted_ts = ts.isoformat()
+
+    now_iso = now.isoformat()
+    outbox_id = f"ob-{offset_days}d-{offset_hours}h-{status}-{tz_suffix}"
+
+    with transaction(temp_db) as cur:
+        cur.execute(
+            """
+            INSERT INTO b2b_price_monitor (
+                entity_key, state_hash, domain, canonical_url, sku,
+                product_title, currency_code, current_price_cents,
+                current_price, availability_status, last_checked_at,
+                last_changed_at, created_at
+            ) VALUES (?, ?, 'domain.com', 'url', 'SKU-TEST', 'title', 'USD', 1000, '10.0000', 'IN_STOCK', ?, ?, ?);
+            """,
+            (ek, sh, now_iso, now_iso, now_iso),
+        )
+        cur.execute(
+            """
+            INSERT INTO price_change_outbox (
+                outbox_id, entity_key, event_type, payload,
+                notification_status, retry_count, created_at, updated_at
+            ) VALUES (?, ?, 'PRICE_CHANGED', '{}', ?, 0, ?, ?);
+            """,
+            (outbox_id, ek, status, formatted_ts, formatted_ts),
+        )
+
+    deleted = purge_dispatched_outbox(temp_db, retention_days=30)
+    expected_deleted = 1 if should_purge else 0
+    assert deleted == expected_deleted
+
+    cur = temp_db.cursor()
+    cur.execute("SELECT COUNT(*) FROM price_change_outbox WHERE outbox_id = ?;", (outbox_id,))
+    count = cur.fetchone()[0]
+    expected_count = 0 if should_purge else 1
+    assert count == expected_count
+

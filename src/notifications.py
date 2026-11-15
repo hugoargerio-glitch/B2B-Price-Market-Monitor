@@ -16,6 +16,7 @@ import urllib.request
 
 from src.config import PROJECT_ROOT
 from src.models import NotificationStatus, OutboxEventType, PriceChangeOutbox
+from src.scraper import validate_safe_url
 
 # Attempt to load .env if present
 try:
@@ -76,12 +77,14 @@ class WebhookNotifier:
 
     @staticmethod
     def classify_change(payload_dict: dict[str, Any]) -> str:
-        """Classify change direction: PRICE_DECREASE, PRICE_INCREASE, AVAILABILITY_CHANGED, INITIAL_CAPTURE."""
+        """Classify change direction: PRICE_DECREASE, PRICE_INCREASE, AVAILABILITY_CHANGED, PROMO_CHANGED, INITIAL_CAPTURE."""
         event_type = payload_dict.get("event_type", OutboxEventType.PRICE_CHANGED.value)
         if event_type == OutboxEventType.INITIAL_CAPTURE.value:
             return "INITIAL_CAPTURE"
         if event_type == OutboxEventType.AVAILABILITY_CHANGED.value:
             return "AVAILABILITY_CHANGED"
+        if event_type in (OutboxEventType.PROMO_CHANGED.value, "PROMO_CHANGED"):
+            return "PROMO_CHANGED"
 
         delta_raw = payload_dict.get("price_delta")
         if delta_raw is not None:
@@ -125,6 +128,15 @@ class WebhookNotifier:
             color = DISCORD_COLOR_AMBER
             title = f"🟡 STOCK STATUS CHANGED: {sku}"
             action_desc = f"Availability status mutated to **{avail}** on **{domain}**."
+        elif change_type == "PROMO_CHANGED":
+            promo = p.get("promo_badge") or "None"
+            color = DISCORD_COLOR_AMBER
+            title = f"🏷️ PROMO BADGE MUTATED: {sku}"
+            action_desc = f"Promotion badge mutated to **{promo}** on **{domain}**."
+        elif change_type == "PRICE_CHANGED":
+            color = DISCORD_COLOR_BLUE
+            title = f"ℹ️ PRICE UPDATED: {sku}"
+            action_desc = f"Price or catalog update detected on **{domain}**."
         else:
             color = DISCORD_COLOR_BLUE
             title = f"ℹ️ NEW PRODUCT MONITORED: {sku}"
@@ -184,7 +196,18 @@ class WebhookNotifier:
         avail = p.get("availability", "IN_STOCK")
         canonical_url = p.get("canonical_url") or f"https://{domain}/products/{sku}"
 
-        emoji = "🟢" if change_type == "PRICE_DECREASE" else ("🔴" if change_type == "PRICE_INCREASE" else "🟡")
+        if change_type == "PRICE_DECREASE":
+            emoji = "🟢"
+        elif change_type == "PRICE_INCREASE":
+            emoji = "🔴"
+        elif change_type == "AVAILABILITY_CHANGED":
+            emoji = "🟡"
+        elif change_type == "PROMO_CHANGED":
+            emoji = "🏷️"
+        elif change_type == "PRICE_CHANGED":
+            emoji = "ℹ️"
+        else:
+            emoji = "ℹ️"
         header_text = f"{emoji} B2B Alert: {change_type} ({sku})"
 
         old_str = f"{currency} {prev_price}" if prev_price is not None else "N/A"
@@ -250,7 +273,18 @@ class WebhookNotifier:
         avail = p.get("availability", "IN_STOCK")
         canonical_url = p.get("canonical_url") or f"https://{domain}/products/{sku}"
 
-        emoji = "🟢" if change_type == "PRICE_DECREASE" else ("🔴" if change_type == "PRICE_INCREASE" else "🟡")
+        if change_type == "PRICE_DECREASE":
+            emoji = "🟢"
+        elif change_type == "PRICE_INCREASE":
+            emoji = "🔴"
+        elif change_type == "AVAILABILITY_CHANGED":
+            emoji = "🟡"
+        elif change_type == "PROMO_CHANGED":
+            emoji = "🏷️"
+        elif change_type == "PRICE_CHANGED":
+            emoji = "ℹ️"
+        else:
+            emoji = "ℹ️"
         title_line = f"{emoji} B2B PRICE ALERT: {change_type} ({sku})"
 
         old_str = f"{currency} {prev_price}" if prev_price is not None else "N/A"
@@ -302,6 +336,7 @@ class WebhookNotifier:
 
         # Real HTTP Webhook Dispatch
         try:
+            validate_safe_url(self.webhook_url, allow_http=True, allow_private=False)
             raw_bytes = json.dumps(payload_data).encode("utf-8")
             req = urllib.request.Request(
                 self.webhook_url,
@@ -321,6 +356,10 @@ class WebhookNotifier:
                 logger.warning("Webhook dispatch failed: %s", self.last_error)
                 return False
 
+        except ValueError as ve:
+            self.last_error = f"ValidationError: {ve}"
+            logger.error("SSRF or URL validation error dispatching outbox %s: %s", outbox_event.outbox_id, self.last_error)
+            return False
         except urllib.error.HTTPError as he:
             self.last_error = f"HTTP {he.code}: {he.reason}"
             logger.error("HTTP error dispatching outbox %s: %s", outbox_event.outbox_id, self.last_error)
