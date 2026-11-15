@@ -29,59 +29,67 @@ Conventional price monitoring scripts and amateur web scrapers suffer from **fiv
 - **Statistically Guarded Circuit Breaker**: Halts customer-facing outbound notifications (`CIRCUIT_HALTED`) and triggers a `TEMPLATE_DRIFT_DETECTED` administrative alert for a domain only when sample size $N \ge 10$ and quarantine failure rate exceeds $20\%$.
 
 ---
-
 ## 2. End-to-End Architecture & Data Flow Topology
 
 ```mermaid
 flowchart TD
     subgraph S1["1. SOURCES & DATA INGESTION (Edge Collectors & CLI)"]
-        A["Competitor APIs / E-Commerces / Headless Collectors"] -->|Raw JSON / HTTP Payloads| B["Ingestion Layer (src/scraper.py & make ingest)"]
-        B -->|Raw Python Dict| C["Shift-Left Pydantic Validator (ScrapePayload)"]
+        A(["Competitor APIs / E-Commerces<br/>Headless Collectors"]) -->|"Raw JSON / HTTP Payloads"| B["Ingestion Layer<br/>src/scraper.py & make ingest"]
+        B -->|"Raw Python Dict"| C{{"Shift-Left Pydantic Validator<br/>ScrapePayload"}}
     end
 
     subgraph S2["2. SHIFT-LEFT VALIDATION & SELF-DEFENSE"]
-        C -->|Malformed / Float / Negative Price| Q["Quarantine Dead-Letter Queue (DLQ)<br/>b2b_price_monitor_quarantine"]
-        C -->|Valid Payload (DECIMAL 18,4)| D["Domain Circuit Breaker Pre-Scan<br/>(min_sample_size >= 10)"]
-        D -->|Sample >= 10 AND Failure Rate > 20%| CB["🚨 CIRCUIT BREAKER TRIPPED<br/>(TEMPLATE_DRIFT_DETECTED / CIRCUIT_HALTED)"]
-        D -->|Normal Flow| E["Dual-Hash CDC Diff Engine"]
+        C -->|"Malformed / Float / Negative Price"| Q[("Quarantine Dead-Letter Queue (DLQ)<br/>b2b_price_monitor_quarantine")]
+        C -->|"Valid Payload (DECIMAL 18,4)"| D["Domain Circuit Breaker Pre-Scan<br/>min_sample_size >= 10"]
+        D -->|"Sample >= 10 AND Failure Rate > 20%"| CB["🚨 CIRCUIT BREAKER TRIPPED<br/>TEMPLATE_DRIFT_DETECTED / CIRCUIT_HALTED"]
+        D -->|"Normal Flow"| E{{"Dual-Hash CDC Diff Engine"}}
     end
 
     subgraph S3["3. TRANSFORMATION & DUAL-HASH CDC ENGINE"]
-        E -->|entity_key| EK["SHA-256(lower(domain) || '::' || UPPER(sku))"]
-        E -->|state_hash| SH["SHA-256(cents || '|' || currency || '|' || stock || '|' || promo)"]
-        EK & SH --> F{"Compare Against Existing State<br/>(B-Tree Primary Key Lookup ~0.05ms)"}
+        E -->|"entity_key"| EK["SHA-256(lower(domain) :: UPPER(sku))"]
+        E -->|"state_hash"| SH["SHA-256(cents &#124; currency &#124; stock &#124; promo)"]
+        EK --> F{"Compare Against Existing State<br/>B-Tree PK Lookup ~0.05ms"}
+        SH --> F
     end
 
     subgraph S4["4. ATOMIC STORAGE (SQLite 3 WAL Single-Writer)"]
-        F -->|Identical state_hash| G["Silent Heartbeat Update ONLY<br/>(last_checked_at = NOW)<br/>Zero Outbox Events!"]
-        F -->|New Entity (First Capture)| H["BEGIN IMMEDIATE TRANSACTION"]
-        F -->|Mutated state_hash (Drift)| H
-        H -->|Upsert Operational State| T1["Operational State Table (SCD Type 1)<br/>b2b_price_monitor"]
-        H -->|Append Mutation Event| T2["Transactional Outbox & Event Ledger<br/>price_change_outbox (Status: PENDING)"]
-        H -->|COMMIT| K["Atomically Consolidated State & Event"]
+        F -->|"Identical state_hash"| G["Silent Heartbeat Update ONLY<br/>last_checked_at = NOW · Zero Outbox Events"]
+        F -->|"New Entity (First Capture)"| H["BEGIN IMMEDIATE TRANSACTION"]
+        F -->|"Mutated state_hash (Drift)"| H
+        H -->|"Upsert Operational State"| T1[("Operational State Table (SCD Type 1)<br/>b2b_price_monitor")]
+        H -->|"Append Mutation Event"| T2[("Transactional Outbox & Event Ledger<br/>price_change_outbox · PENDING")]
+        H -->|"COMMIT"| K["Atomically Consolidated State & Event"]
     end
 
     subgraph S5["5. DECOUPLED DISTRIBUTION (Transactional Outbox)"]
-        K --> L["OutboxDispatcher (fetch_pending_events)<br/>Exponential Backoff + Full Jitter"]
-        L --> M["WebhookNotifier (Multi-Channel Adapter)"]
-        M -->|Semantic Color Embeds| D1["Discord Webhook (HTTP 204)"]
-        M -->|Structured Block Kit| S1_SL["Slack Webhook (HTTP 200)"]
-        M -->|Offline / CI / Dry-Run| C1["Console Mock ASCII Box"]
-        M -->|Delivery Success| O1["Mark Outbox: DISPATCHED"]
-        M -->|Network Error / HTTP 429| O2["Increment retry_count + Backoff (max 5)"]
-        O2 -->|Retries >= 5| O3["Isolate in DEAD_LETTER"]
+        K --> L["OutboxDispatcher · fetch_pending_events<br/>Exponential Backoff + Full Jitter"]
+        L --> M{{"WebhookNotifier<br/>Multi-Channel Adapter"}}
+        M -->|"Semantic Color Embeds"| D1(["Discord Webhook · HTTP 204"])
+        M -->|"Structured Block Kit"| S1_SL(["Slack Webhook · HTTP 200"])
+        M -->|"Offline / CI / Dry-Run"| C1(["Console Mock ASCII Box"])
+        M -->|"Delivery Success"| O1["Mark Outbox: DISPATCHED"]
+        M -->|"Network Error / HTTP 429"| O2["Increment retry_count + Backoff (max 5)"]
+        O2 -->|"Retries >= 5"| O3[("Isolate in DEAD_LETTER")]
     end
 
-    classDef success fill:#2ecc71,stroke:#27ae60,stroke-width:2px,color:#fff;
-    classDef warning fill:#f39c12,stroke:#d35400,stroke-width:2px,color:#fff;
-    classDef danger fill:#e74c3c,stroke:#c0392b,stroke-width:2px,color:#fff;
-    classDef store fill:#3498db,stroke:#2980b9,stroke-width:2px,color:#fff;
+    classDef success fill:#1f7a4c,stroke:#2ecc71,stroke-width:2px,color:#ffffff;
+    classDef warning fill:#b9770e,stroke:#f39c12,stroke-width:2px,color:#ffffff;
+    classDef danger fill:#922b21,stroke:#e74c3c,stroke-width:2px,color:#ffffff;
+    classDef store fill:#1f618d,stroke:#3498db,stroke-width:2px,color:#ffffff;
+    classDef engine fill:#5b2c6f,stroke:#9b59b6,stroke-width:2px,color:#ffffff;
 
-    class G,O1,D1,S1_SL success;
+    class G,O1,D1,S1_SL,C1 success;
     class CB,Q,O2 warning;
     class O3 danger;
     class T1,T2,EK,SH store;
-```
+    class C,E,M engine;
+
+    style S1 fill:transparent,stroke:#58a6ff,stroke-width:1.5px,stroke-dasharray: 4 4;
+    style S2 fill:transparent,stroke:#f39c12,stroke-width:1.5px,stroke-dasharray: 4 4;
+    style S3 fill:transparent,stroke:#9b59b6,stroke-width:1.5px,stroke-dasharray: 4 4;
+    style S4 fill:transparent,stroke:#3498db,stroke-width:1.5px,stroke-dasharray: 4 4;
+    style S5 fill:transparent,stroke:#2ecc71,stroke-width:1.5px,stroke-dasharray: 4 4;
+``
 
 ---
 
